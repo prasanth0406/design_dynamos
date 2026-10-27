@@ -240,37 +240,34 @@ class _RoleAuthScreenState extends State<RoleAuthScreen> {
 
   final LocalAuthentication _localAuth = LocalAuthentication();
 
-  /// Shows the device's biometric prompt before email/password sign-in.
-  /// This checks the device owner locally; Supabase still verifies the account.
-  Future<bool> authenticateWithBiometrics() async {
+  /// Uses the phone's available biometric and permits its screen-lock fallback.
+  /// Supabase still verifies the account after local device authentication.
+  Future<bool> authenticateWithDeviceSecurity() async {
     try {
       final bool isDeviceSupported = await _localAuth.isDeviceSupported();
-      final bool canCheckBiometrics = await _localAuth.canCheckBiometrics;
-
-      if (!isDeviceSupported || !canCheckBiometrics) {
-        showMessage(
-          'Biometric authentication is unavailable. Set up a fingerprint on your device and try again.',
-        );
+      if (!isDeviceSupported) {
+        showMessage('Set up face unlock, a fingerprint, or a phone screen lock first.');
         return false;
       }
 
       final bool authenticated = await _localAuth.authenticate(
-        localizedReason:
-        'Verify your identity to sign in to Oceanic Attendance.',
-        biometricOnly: true,
+        localizedReason: 'Verify with face, fingerprint, or your phone screen lock.',
+        // False allows Android to offer the device PIN, pattern, or password.
+        biometricOnly: false,
+        persistAcrossBackgrounding: true,
       );
 
       if (!authenticated) {
-        showMessage('Fingerprint verification was cancelled or failed.');
+        showMessage('Device verification was cancelled or failed.');
       }
       return authenticated;
     } on LocalAuthException catch (error) {
-      debugPrint('Biometric authentication error: ${error.code}');
-      showMessage('Biometric authentication failed. Please try again.');
+      debugPrint('Local authentication error: ${error.code}');
+      showMessage('Device verification failed. Try face, fingerprint, or phone lock again.');
       return false;
     } catch (error) {
-      debugPrint('Unexpected biometric error: $error');
-      showMessage('Unable to start fingerprint verification on this device.');
+      debugPrint('Unexpected local authentication error: $error');
+      showMessage('Unable to start device verification on this phone.');
       return false;
     }
   }
@@ -361,10 +358,9 @@ class _RoleAuthScreenState extends State<RoleAuthScreen> {
     setState(() => isLoading = true);
 
     try {
-      // Ask for device biometric verification after the user taps SIGN IN.
-      // Only continue to Supabase if verification succeeds.
-      final biometricVerified = await authenticateWithBiometrics();
-      if (!biometricVerified) return;
+      // Verify locally before asking Supabase to authenticate the account.
+      final deviceVerified = await authenticateWithDeviceSecurity();
+      if (!deviceVerified) return;
 
       final response = await Supabase.instance.client.auth.signInWithPassword(
         email: email,
@@ -481,6 +477,25 @@ class _RoleAuthScreenState extends State<RoleAuthScreen> {
                         },
                       ),
                     ),
+                    if (!isSignUp) ...[
+                      const SizedBox(height: 12),
+                      Row(
+                        crossAxisAlignment: CrossAxisAlignment.start,
+                        children: [
+                          const Icon(Icons.security, color: aquamarine, size: 18),
+                          const SizedBox(width: 8),
+                          Expanded(
+                            child: Text(
+                              'Verify with face or fingerprint. You can use your phone PIN, pattern, or password from the system prompt.',
+                              style: TextStyle(
+                                color: white.withValues(alpha: 0.8),
+                                fontSize: 12,
+                              ),
+                            ),
+                          ),
+                        ],
+                      ),
+                    ],
                     const SizedBox(height: 26),
                     SizedBox(
                       width: double.infinity,

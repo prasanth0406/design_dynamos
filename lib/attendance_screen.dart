@@ -6,6 +6,8 @@ import 'package:flutter_ble_peripheral/flutter_ble_peripheral.dart';
 import 'package:flutter_blue_plus/flutter_blue_plus.dart';
 import 'package:permission_handler/permission_handler.dart';
 import 'package:supabase_flutter/supabase_flutter.dart';
+import 'package:qr_flutter/qr_flutter.dart';
+import 'package:mobile_scanner/mobile_scanner.dart';
 
 const String bleServiceUuid = 'bf27730d-860a-4e09-889c-2d8b6a9e0fe7';
 // Both phones use this shared topic so the teacher can validate the submitted code.
@@ -92,7 +94,6 @@ class _SessionNameDialogState extends State<_SessionNameDialog> {
     );
   }
 }
-
 /// Teacher creates a named session and advertises the BLE service.
 /// Attendance confirmations are sent over a Supabase Realtime broadcast channel.
 class TeacherBleScreen extends StatefulWidget {
@@ -111,6 +112,19 @@ class _TeacherBleScreenState extends State<TeacherBleScreen> {
   String _status = 'Create a session to begin attendance.';
   String _sessionName = '';
   String _sessionCode = '';
+  final Set<String> _issuedSessionCodes = <String>{};
+  Timer? _qrRotationTimer;
+  Timer? _sessionEndTimer;
+  int _qrNumber = 0;
+  DateTime? _sessionEndsAt;
+
+  String _generateSessionCode() {
+    String code;
+    do {
+      code = _newSessionCode();
+    } while (!_issuedSessionCodes.add(code));
+    return code;
+  }
 
   Future<String?> _askSessionName() {
     // The dialog owns its controller and disposes it only when its own State
@@ -150,7 +164,8 @@ class _TeacherBleScreenState extends State<TeacherBleScreen> {
         throw Exception('Bluetooth permission was not granted ($permissionState).');
       }
 
-      final code = _newSessionCode();
+      _issuedSessionCodes.clear();
+      final code = _generateSessionCode();
       final channel = Supabase.instance.client.channel(
         attendanceTopic,
         opts: const RealtimeChannelConfig(self: false),
@@ -161,7 +176,8 @@ class _TeacherBleScreenState extends State<TeacherBleScreen> {
         final requestId = payload['request_id']?.toString() ?? '';
         if (email.isEmpty || !email.endsWith('@iiitdwd.ac.in') || requestId.isEmpty) return;
 
-        final isValid = submittedCode == code;
+        final isValid = _isAdvertising && submittedCode == _sessionCode &&
+            _sessionEndsAt != null && DateTime.now().isBefore(_sessionEndsAt!);
         if (isValid && mounted) {
           setState(() {
             _presentStudents.putIfAbsent(email, () => DateTime.now());
@@ -172,7 +188,7 @@ class _TeacherBleScreenState extends State<TeacherBleScreen> {
         unawaited(channel.sendBroadcastMessage(event: 'attendance_result', payload: {
           'request_id': requestId,
           'valid': isValid,
-          'message': isValid ? 'Attendance confirmed.' : 'Incorrect session code. Check the teacher phone and try again.',
+          'message': isValid ? 'Attendance confirmed.' : 'This QR code is incorrect or expired. Scan the current code and try again.',
         }));
       });
       await _subscribeAndWait(channel);
@@ -191,10 +207,13 @@ class _TeacherBleScreenState extends State<TeacherBleScreen> {
       setState(() {
         _sessionName = name.trim();
         _sessionCode = code;
+        _qrNumber = 1;
+        _sessionEndsAt = DateTime.now().add(const Duration(minutes: 1));
         _isAdvertising = true;
         _presentStudents.clear();
-        _status = 'BLE is active. Students can find the teacher and enter the session code.';
+        _status = 'QR 1 of 6 is active for 10 seconds. BLE must also be detected.';
       });
+      _startQrTimers();
     } catch (error) {
       if (!mounted) return;
       setState(() => _status = 'Could not start attendance: $error');
@@ -203,7 +222,38 @@ class _TeacherBleScreenState extends State<TeacherBleScreen> {
     }
   }
 
-  Future<void> _stopAdvertising() async {
+  void _startQrTimers() {
+    _qrRotationTimer?.cancel();
+    _sessionEndTimer?.cancel();
+
+    _qrRotationTimer = Timer.periodic(const Duration(seconds: 10), (timer) {
+      if (timer.tick >= 6) {
+        timer.cancel();
+        return;
+      }
+      if (!mounted || !_isAdvertising) {
+        timer.cancel();
+        return;
+      }
+      setState(() {
+        _sessionCode = _generateSessionCode();
+        _qrNumber = timer.tick + 1;
+        _status = 'QR $_qrNumber of 6 is active for 10 seconds.';
+      });
+    });
+
+    _sessionEndTimer = Timer(const Duration(minutes: 1), () {
+      if (mounted && _isAdvertising) {
+        unawaited(_stopAdvertising(sessionExpired: true));
+      }
+    });
+  }
+
+  Future<void> _stopAdvertising({bool sessionExpired = false}) async {
+    _qrRotationTimer?.cancel();
+    _sessionEndTimer?.cancel();
+    _qrRotationTimer = null;
+    _sessionEndTimer = null;
     try {
       await _peripheral.stop();
       final channel = _attendanceChannel;
@@ -212,7 +262,10 @@ class _TeacherBleScreenState extends State<TeacherBleScreen> {
       setState(() {
         _attendanceChannel = null;
         _isAdvertising = false;
-        _status = 'Session stopped. ${_presentStudents.length} student(s) marked present.';
+        _sessionEndsAt = null;
+        _status = sessionExpired
+            ? 'One-minute session expired. ${_presentStudents.length} student(s) marked present.'
+            : 'Session stopped. ${_presentStudents.length} student(s) marked present.';
       });
     } catch (error) {
       if (mounted) setState(() => _status = 'Could not stop session: $error');
@@ -221,6 +274,8 @@ class _TeacherBleScreenState extends State<TeacherBleScreen> {
 
   @override
   void dispose() {
+    _qrRotationTimer?.cancel();
+    _sessionEndTimer?.cancel();
     unawaited(_peripheral.stop());
     final channel = _attendanceChannel;
     if (channel != null) unawaited(Supabase.instance.client.removeChannel(channel));
@@ -252,8 +307,30 @@ class _TeacherBleScreenState extends State<TeacherBleScreen> {
                 const SizedBox(height: 4),
                 Text(_sessionName, style: const TextStyle(color: Colors.white, fontSize: 18, fontWeight: FontWeight.bold)),
                 const SizedBox(height: 14),
-                const Text('SESSION CODE — share with students', style: TextStyle(color: Colors.white70, fontSize: 12)),
+                Text('ROTATING QR CODE — QR $_qrNumber OF 6', style: const TextStyle(color: Colors.white70, fontSize: 12)),
                 SelectableText(_sessionCode, style: const TextStyle(color: bleCyan, fontSize: 30, fontWeight: FontWeight.bold, letterSpacing: 5)),
+                const SizedBox(height: 4),
+                const Text('Each QR is valid for 10 seconds', style: TextStyle(color: Colors.white70, fontSize: 12)),
+                const SizedBox(height: 20),
+                const Text(
+                  'SCAN THE CURRENT QR WITHIN 10 SECONDS',
+                  style: TextStyle(color: Colors.white, fontSize: 13, fontWeight: FontWeight.bold),
+                ),
+                const SizedBox(height: 12),
+                Center(
+                  child: Container(
+                    padding: const EdgeInsets.all(12),
+                    decoration: BoxDecoration(
+                      color: Colors.white,
+                      borderRadius: BorderRadius.circular(16),
+                    ),
+                    child: QrImageView(
+                      data: _sessionCode,
+                      version: QrVersions.auto,
+                      size: 220,
+                    ),
+                  ),
+                ),
               ]),
             )),
           ],
@@ -284,7 +361,7 @@ class _TeacherBleScreenState extends State<TeacherBleScreen> {
               ),
             )),
           const SizedBox(height: 12),
-          const Text('Keep this screen open. This is a test prototype; attendance is not yet saved to a permanent database.',
+          const Text('The session lasts 1 minute. Six unique QR codes rotate every 10 seconds. Attendance is not yet saved to a permanent database.',
               textAlign: TextAlign.center, style: TextStyle(color: Colors.white54, fontSize: 12)),
         ],
       ),
@@ -309,6 +386,7 @@ class _StudentBleScreenState extends State<StudentBleScreen> {
   bool _isScanning = false;
   bool _isLoading = false;
   bool _isPresent = false;
+  bool _qrScanned = false;
   String _status = 'Tap FIND TEACHER to scan for a teacher signal.';
 
   Future<void> _startScanning() async {
@@ -317,6 +395,8 @@ class _StudentBleScreenState extends State<StudentBleScreen> {
       _isLoading = true;
       _detectedTeachers.clear();
       _isPresent = false;
+      _qrScanned = false;
+      _sessionCodeController.clear();
       _status = 'Requesting Bluetooth permissions...';
     });
     try {
@@ -371,6 +451,10 @@ class _StudentBleScreenState extends State<StudentBleScreen> {
     if (_isLoading || _isPresent) return;
     if (_detectedTeachers.isEmpty) {
       setState(() => _status = 'Find the teacher via BLE before marking attendance.');
+      return;
+    }
+    if (!_qrScanned) {
+      setState(() => _status = 'Scan the teacher QR code after detecting the BLE signal.');
       return;
     }
     final user = Supabase.instance.client.auth.currentUser;
@@ -470,21 +554,44 @@ class _StudentBleScreenState extends State<StudentBleScreen> {
                   subtitle: Text('Signal: ${_detectedTeachers.values.first.rssi} dBm', style: const TextStyle(color: Colors.white70)),
                 )),
                 const SizedBox(height: 10),
-                TextField(
-                  controller: _sessionCodeController,
-                  keyboardType: TextInputType.number,
-                  maxLength: 6,
-                  style: const TextStyle(color: Colors.white),
-                  decoration: const InputDecoration(
-                    labelText: 'Teacher session code', labelStyle: TextStyle(color: Colors.white70),
-                    hintText: 'Enter 6-digit code', hintStyle: TextStyle(color: Colors.white38),
-                    counterStyle: TextStyle(color: Colors.white54),
-                    enabledBorder: OutlineInputBorder(borderSide: BorderSide(color: Colors.white38)),
-                    focusedBorder: OutlineInputBorder(borderSide: BorderSide(color: bleCyan)),
+                const SizedBox(height: 12),
+                Text(
+                  _qrScanned ? 'QR code scanned successfully' : 'Scan the QR code displayed on the teacher phone',
+                  textAlign: TextAlign.center,
+                  style: TextStyle(
+                    color: _qrScanned ? Colors.greenAccent : Colors.white70,
+                    fontWeight: FontWeight.w600,
                   ),
                 ),
+                const SizedBox(height: 10),
+                ClipRRect(
+                  borderRadius: BorderRadius.circular(16),
+                  child: SizedBox(
+                    height: 260,
+                    width: double.infinity,
+                    child: MobileScanner(
+                      onDetect: (capture) {
+                        if (!mounted) return;
+                        for (final barcode in capture.barcodes) {
+                          final value = barcode.rawValue?.trim();
+                          if (value != null &&
+                              value != _sessionCodeController.text &&
+                              RegExp(r'^\d{6}$').hasMatch(value)) {
+                            setState(() {
+                              _sessionCodeController.text = value;
+                              _qrScanned = true;
+                              _status = 'Current QR scanned. BLE and QR requirements are satisfied; you can mark attendance.';
+                            });
+                            break;
+                          }
+                        }
+                      },
+                    ),
+                  ),
+                ),
+                const SizedBox(height: 12),
                 SizedBox(width: double.infinity, child: ElevatedButton.icon(
-                  onPressed: _isLoading || _isPresent ? null : _markPresent,
+                  onPressed: _isLoading || _isPresent || !_qrScanned || _detectedTeachers.isEmpty ? null : _markPresent,
                   icon: Icon(_isPresent ? Icons.check_circle : Icons.how_to_reg),
                   label: Text(_isPresent ? 'MARKED PRESENT' : 'ALLOW / MARK PRESENT'),
                   style: ElevatedButton.styleFrom(backgroundColor: _isPresent ? Colors.green : bleCyan,
@@ -492,7 +599,7 @@ class _StudentBleScreenState extends State<StudentBleScreen> {
                 )),
               ],
               const SizedBox(height: 20),
-              const Text('Testing prototype: teacher and student phones must both be online and connected to the same Supabase project.',
+              const Text('Attendance requires both a detected teacher BLE signal and a scanned session QR code. Both phones must be online and use the same Supabase project.',
                   textAlign: TextAlign.center, style: TextStyle(color: Colors.white54, fontSize: 12)),
             ],
           ),
