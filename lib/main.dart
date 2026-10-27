@@ -195,12 +195,12 @@ class _SecureStartupRouterState extends State<SecureStartupRouter> {
     if (binding != null) {
       if (session == null) {
         return const SessionRecoveryScreen(
-          message: 'The saved Supabase session is missing or expired. Reauthenticate to use this account.',
+          message: 'The saved Supabase session is missing or expired. Secure account recovery is required before this account can be used.',
         );
       }
       if (session.user.id != binding.userId) {
         return const SessionRecoveryScreen(
-          message: 'The saved Supabase account does not match this device binding. Reauthenticate to recover access.',
+          message: 'The saved Supabase account does not match this device binding. Secure account recovery is required before access can be restored.',
         );
       }
       return DeviceUnlockScreen(binding: binding);
@@ -210,7 +210,7 @@ class _SecureStartupRouterState extends State<SecureStartupRouter> {
       final role = _userRoleFromValue(session.user.userMetadata?['role']);
       if (role == null) {
         return const SessionRecoveryScreen(
-          message: 'This Supabase account has no valid attendance role. Sign out and reauthenticate to recover access.',
+          message: 'This Supabase account has no valid attendance role. Contact your administrator to restore access.',
         );
       }
       return DeviceAuthSetupScreen(userId: session.user.id, role: role);
@@ -227,7 +227,7 @@ class _SecureStartupRouterState extends State<SecureStartupRouter> {
         if (snapshot.hasData) return snapshot.data!;
         if (snapshot.hasError) {
           return const SessionRecoveryScreen(
-            message: 'Secure device sign-in could not be read. Use account recovery to sign in again.',
+            message: 'Secure device sign-in could not be read. Secure account recovery is required before access can be restored.',
           );
         }
         return const Scaffold(
@@ -800,52 +800,6 @@ class _RoleAuthScreenState extends State<RoleAuthScreen> {
   }
 }
 
-Future<void> _signOutAndReturnToRoleSelection(BuildContext context) async {
-  try {
-    await Supabase.instance.client.auth.signOut(scope: SignOutScope.local);
-    await DeviceAccountBindingStore.clear();
-    if (!context.mounted) return;
-    Navigator.of(context).pushAndRemoveUntil(
-      MaterialPageRoute<void>(builder: (_) => const RoleSelectionScreen()),
-      (route) => false,
-    );
-  } catch (error) {
-    if (!context.mounted) return;
-    ScaffoldMessenger.of(context).showSnackBar(
-      const SnackBar(
-        content: Text('Sign out could not finish. This device remains locked to its account.'),
-        behavior: SnackBarBehavior.floating,
-      ),
-    );
-    debugPrint('Secure sign-out failed: $error');
-  }
-}
-
-Future<void> _confirmSignOutAndReturn(BuildContext context) async {
-  final shouldSignOut = await showDialog<bool>(
-    context: context,
-    builder: (dialogContext) => AlertDialog(
-      title: const Text('Sign out and unlink this device?'),
-      content: const Text(
-        'This clears the saved account on this phone. The next sign-in will require your Supabase email and password, then device unlock setup again.',
-      ),
-      actions: [
-        TextButton(
-          onPressed: () => Navigator.pop(dialogContext, false),
-          child: const Text('CANCEL'),
-        ),
-        FilledButton(
-          onPressed: () => Navigator.pop(dialogContext, true),
-          child: const Text('SIGN OUT'),
-        ),
-      ],
-    ),
-  );
-  if (shouldSignOut == true && context.mounted) {
-    await _signOutAndReturnToRoleSelection(context);
-  }
-}
-
 class DeviceAuthSetupScreen extends StatefulWidget {
   const DeviceAuthSetupScreen({
     super.key,
@@ -907,7 +861,7 @@ class _DeviceAuthSetupScreenState extends State<DeviceAuthSetupScreen> {
       );
     } on DeviceSessionValidationException catch (error) {
       if (mounted) {
-        setState(() => _status = '${error.message} Sign out and reauthenticate to recover access.');
+        setState(() => _status = '${error.message} Secure account recovery is required before the dashboard can open.');
       }
     } on AuthRetryableFetchException catch (error) {
       debugPrint('Supabase setup could not reach the server: ${error.message}');
@@ -917,7 +871,7 @@ class _DeviceAuthSetupScreenState extends State<DeviceAuthSetupScreen> {
     } on AuthException catch (error) {
       debugPrint('Supabase setup validation failed: ${error.message}');
       if (mounted) {
-        setState(() => _status = 'Supabase could not validate this account. Check your connection and retry, or sign out and reauthenticate.');
+        setState(() => _status = 'Supabase could not validate this account. Check your connection and retry setup.');
       }
     } catch (error) {
       debugPrint('Device unlock setup failed: $error');
@@ -986,12 +940,6 @@ class _DeviceAuthSetupScreenState extends State<DeviceAuthSetupScreen> {
                         ),
                       ),
                     ),
-                    TextButton(
-                      onPressed: _isLoading
-                          ? null
-                          : () => _confirmSignOutAndReturn(context),
-                      child: const Text('Sign out and use another account'),
-                    ),
                   ],
                 ),
               ),
@@ -1014,14 +962,12 @@ class DeviceUnlockScreen extends StatefulWidget {
 
 class _DeviceUnlockScreenState extends State<DeviceUnlockScreen> {
   bool _isLoading = false;
-  bool _needsRecovery = false;
   String _status = '';
 
   Future<void> _unlock() async {
     if (_isLoading) return;
     setState(() {
       _isLoading = true;
-      _needsRecovery = false;
       _status = 'Waiting for device authentication...';
     });
 
@@ -1050,8 +996,7 @@ class _DeviceUnlockScreenState extends State<DeviceUnlockScreen> {
     } on DeviceSessionValidationException catch (error) {
       if (!mounted) return;
       setState(() {
-        _needsRecovery = true;
-        _status = '${error.message} Account recovery or reauthentication is required.';
+        _status = '${error.message} Secure account recovery is required; the dashboard remains locked.';
       });
     } on AuthRetryableFetchException catch (error) {
       debugPrint('Supabase unlock could not reach the server: ${error.message}');
@@ -1063,8 +1008,7 @@ class _DeviceUnlockScreenState extends State<DeviceUnlockScreen> {
       debugPrint('Supabase unlock validation failed: ${error.message}');
       if (!mounted) return;
       setState(() {
-        _needsRecovery = true;
-        _status = 'Supabase rejected the saved session. Account recovery or reauthentication is required.';
+        _status = 'Supabase rejected the saved session. Secure account recovery is required; the dashboard remains locked.';
       });
     } on TimeoutException {
       if (!mounted) return;
@@ -1135,21 +1079,6 @@ class _DeviceUnlockScreenState extends State<DeviceUnlockScreen> {
                         ),
                       ),
                     ),
-                    if (_needsRecovery) ...[
-                      const SizedBox(height: 8),
-                      const Text(
-                        'Your dashboard stays locked until the Supabase account is recovered.',
-                        textAlign: TextAlign.center,
-                        style: TextStyle(color: Colors.white70),
-                      ),
-                      const SizedBox(height: 8),
-                      TextButton(
-                        onPressed: _isLoading
-                            ? null
-                            : () => _confirmSignOutAndReturn(context),
-                        child: const Text('Account recovery / sign out'),
-                      ),
-                    ],
                   ],
                 ),
               ),
@@ -1191,20 +1120,6 @@ class SessionRecoveryScreen extends StatelessWidget {
                       textAlign: TextAlign.center,
                       style: TextStyle(color: white.withValues(alpha: 0.85)),
                     ),
-                    const SizedBox(height: 22),
-                    SizedBox(
-                      width: double.infinity,
-                      child: ElevatedButton.icon(
-                        onPressed: () => _signOutAndReturnToRoleSelection(context),
-                        icon: const Icon(Icons.logout),
-                        label: const Text('SIGN OUT AND REAUTHENTICATE'),
-                        style: ElevatedButton.styleFrom(
-                          backgroundColor: aquamarine,
-                          foregroundColor: deepNavy,
-                          padding: const EdgeInsets.symmetric(vertical: 15),
-                        ),
-                      ),
-                    ),
                   ],
                 ),
               ),
@@ -1221,10 +1136,6 @@ class DashboardScreen extends StatelessWidget {
 
   const DashboardScreen({super.key, required this.role});
 
-  Future<void> _signOut(BuildContext context) async {
-    await _confirmSignOutAndReturn(context);
-  }
-
   @override
   Widget build(BuildContext context) {
     final isTeacher = role == UserRole.teacher;
@@ -1234,13 +1145,7 @@ class DashboardScreen extends StatelessWidget {
         title: Text('${role.label} Dashboard'),
         backgroundColor: deepNavy,
         foregroundColor: white,
-        actions: [
-          IconButton(
-            tooltip: 'Sign out and unlink this device',
-            onPressed: () => _signOut(context),
-            icon: const Icon(Icons.logout),
-          ),
-        ],
+        actions: const [],
       ),
       body: OceanBackground(
         child: Center(
