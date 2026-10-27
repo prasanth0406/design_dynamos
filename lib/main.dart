@@ -1,15 +1,18 @@
 import 'dart:async';
 import 'dart:convert';
-import 'dart:ui';
 
 import 'package:flutter/material.dart';
 import 'package:local_auth/local_auth.dart';
 import 'package:flutter_secure_storage/flutter_secure_storage.dart';
+
+import 'app_theme.dart';
 import 'attendance_screen.dart';
+
 import 'package:supabase_flutter/supabase_flutter.dart';
 
 const String supabaseProjectUrl = 'https://otfazpvwsxintyzcytvx.supabase.co';
-const String supabasePublishableKey = 'sb_publishable_dy9LkmDGDwFVHTzGdiqnbA_CwKgVJKZ';
+const String supabasePublishableKey =
+    'sb_publishable_dy9LkmDGDwFVHTzGdiqnbA_CwKgVJKZ';
 const String _secureSupabaseSessionKey = 'oceanic_supabase_session_v1';
 const String _deviceBindingKey = 'oceanic_device_account_binding_v1';
 const String _legacySupabaseSessionKey = 'sb-otfazpvwsxintyzcytvx-auth-token';
@@ -21,9 +24,9 @@ final FlutterSecureStorage _secureStorage = FlutterSecureStorage();
 /// to sign in again after upgrading this app.
 class SecureSupabaseLocalStorage extends LocalStorage {
   SecureSupabaseLocalStorage()
-      : _legacyStorage = SharedPreferencesLocalStorage(
-          persistSessionKey: _legacySupabaseSessionKey,
-        );
+    : _legacyStorage = SharedPreferencesLocalStorage(
+        persistSessionKey: _legacySupabaseSessionKey,
+      );
 
   final SharedPreferencesLocalStorage _legacyStorage;
 
@@ -58,11 +61,8 @@ class SecureSupabaseLocalStorage extends LocalStorage {
       _secureStorage.delete(key: _secureSupabaseSessionKey);
 
   @override
-  Future<void> persistSession(String persistSessionString) =>
-      _secureStorage.write(
-        key: _secureSupabaseSessionKey,
-        value: persistSessionString,
-      );
+  Future<void> persistSession(String persistSessionString) => _secureStorage
+      .write(key: _secureSupabaseSessionKey, value: persistSessionString);
 }
 
 Future<void> main() async {
@@ -78,12 +78,6 @@ Future<void> main() async {
 
   runApp(const MyApp());
 }
-
-// Ocean theme colors
-const Color midnightBlue = Color(0xFF081328);
-const Color deepNavy = Color(0xFF102C51);
-const Color aquamarine = Color(0xFF5BC0BE);
-const Color white = Colors.white;
 
 enum UserRole { student, teacher }
 
@@ -131,8 +125,7 @@ class DeviceAccountBindingStore {
   static Future<void> save(DeviceAccountBinding binding) =>
       _secureStorage.write(key: _deviceBindingKey, value: binding.encode());
 
-  static Future<void> clear() =>
-      _secureStorage.delete(key: _deviceBindingKey);
+  static Future<void> clear() => _secureStorage.delete(key: _deviceBindingKey);
 }
 
 class DeviceSessionValidationException implements Exception {
@@ -232,7 +225,7 @@ class _SecureStartupRouterState extends State<SecureStartupRouter> {
         }
         return const Scaffold(
           backgroundColor: deepNavy,
-          body: Center(child: CircularProgressIndicator(color: aquamarine)),
+          body: Center(child: CircularProgressIndicator(color: brandOrange)),
         );
       },
     );
@@ -247,11 +240,7 @@ class MyApp extends StatelessWidget {
     return MaterialApp(
       debugShowCheckedModeBanner: false,
       title: 'Oceanic Attendance',
-      theme: ThemeData(
-        useMaterial3: true,
-        fontFamily: 'Roboto',
-        colorScheme: ColorScheme.fromSeed(seedColor: aquamarine),
-      ),
+      theme: AttendanceAppTheme.light,
       home: const SecureStartupRouter(),
     );
   }
@@ -290,26 +279,26 @@ class RoleSelectionScreen extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     return Scaffold(
-      body: OceanBackground(
+      body: AppBackground(
         child: SafeArea(
           child: Center(
             child: SingleChildScrollView(
-              padding: const EdgeInsets.all(24),
-              child: GlassCard(
+              padding: const EdgeInsets.all(AppSpacing.large),
+              child: AppSurfaceCard(
                 child: Column(
                   mainAxisSize: MainAxisSize.min,
                   children: [
                     const Icon(
                       Icons.waves_rounded,
                       size: 62,
-                      color: aquamarine,
+                      color: brandOrange,
                     ),
                     const SizedBox(height: 16),
                     const Text(
                       'Oceanic Attendance',
                       textAlign: TextAlign.center,
                       style: TextStyle(
-                        color: white,
+                        color: ink,
                         fontSize: 28,
                         fontWeight: FontWeight.bold,
                       ),
@@ -318,10 +307,7 @@ class RoleSelectionScreen extends StatelessWidget {
                     Text(
                       'Choose how you want to sign in',
                       textAlign: TextAlign.center,
-                      style: TextStyle(
-                        color: white.withValues(alpha: 0.82),
-                        fontSize: 15,
-                      ),
+                      style: TextStyle(color: mutedInk, fontSize: 15),
                     ),
                     const SizedBox(height: 32),
                     RoleButton(
@@ -380,22 +366,34 @@ class RoleButton extends StatelessWidget {
       width: double.infinity,
       child: DecoratedBox(
         decoration: BoxDecoration(
-          gradient: const LinearGradient(
-            colors: [Color(0xFF13C8D2), Color(0xFF377FAF)],
-          ),
-          borderRadius: BorderRadius.circular(20),
-          border: Border.all(color: white.withValues(alpha: 0.7)),
+          gradient: const LinearGradient(colors: [deepNavy, brandBlue]),
+          borderRadius: BorderRadius.circular(AppRadii.tile),
+          boxShadow: const [
+            BoxShadow(
+              color: Color(0x33102C51),
+              blurRadius: 18,
+              offset: Offset(0, 8),
+            ),
+          ],
         ),
         child: Material(
           color: Colors.transparent,
           child: InkWell(
-            borderRadius: BorderRadius.circular(20),
+            borderRadius: BorderRadius.circular(AppRadii.tile),
             onTap: onTap,
             child: Padding(
               padding: const EdgeInsets.symmetric(horizontal: 18, vertical: 18),
               child: Row(
                 children: [
-                  Icon(icon, color: white, size: 34),
+                  Container(
+                    width: 54,
+                    height: 54,
+                    decoration: const BoxDecoration(
+                      color: Color(0x33F28A2E),
+                      shape: BoxShape.circle,
+                    ),
+                    child: Icon(icon, color: brandOrange, size: 30),
+                  ),
                   const SizedBox(width: 16),
                   Expanded(
                     child: Column(
@@ -413,14 +411,18 @@ class RoleButton extends StatelessWidget {
                         Text(
                           subtitle,
                           style: TextStyle(
-                            color: white.withValues(alpha: 0.85),
+                            color: white.withValues(alpha: 0.78),
                             fontSize: 13,
                           ),
                         ),
                       ],
                     ),
                   ),
-                  const Icon(Icons.arrow_forward_ios, color: white, size: 18),
+                  const Icon(
+                    Icons.arrow_forward_ios,
+                    color: brandOrange,
+                    size: 18,
+                  ),
                 ],
               ),
             ),
@@ -472,10 +474,7 @@ class _RoleAuthScreenState extends State<RoleAuthScreen> {
   void showMessage(String message) {
     if (!mounted) return;
     ScaffoldMessenger.of(context).showSnackBar(
-      SnackBar(
-        content: Text(message),
-        behavior: SnackBarBehavior.floating,
-      ),
+      SnackBar(content: Text(message), behavior: SnackBarBehavior.floating),
     );
   }
 
@@ -519,7 +518,9 @@ class _RoleAuthScreenState extends State<RoleAuthScreen> {
       if (response.session != null) {
         final user = response.user;
         if (user == null) {
-          showMessage('Account was created, but secure setup could not start. Sign in to continue.');
+          showMessage(
+            'Account was created, but secure setup could not start. Sign in to continue.',
+          );
           return;
         }
         _openDeviceSetup(user.id, widget.role);
@@ -605,12 +606,12 @@ class _RoleAuthScreenState extends State<RoleAuthScreen> {
     final roleName = widget.role.label;
 
     return Scaffold(
-      body: OceanBackground(
+      body: AppBackground(
         child: SafeArea(
           child: Center(
             child: SingleChildScrollView(
-              padding: const EdgeInsets.all(24),
-              child: GlassCard(
+              padding: const EdgeInsets.all(AppSpacing.large),
+              child: AppSurfaceCard(
                 child: Column(
                   mainAxisSize: MainAxisSize.min,
                   children: [
@@ -618,14 +619,14 @@ class _RoleAuthScreenState extends State<RoleAuthScreen> {
                       alignment: Alignment.centerLeft,
                       child: IconButton(
                         onPressed: () => Navigator.pop(context),
-                        icon: const Icon(Icons.arrow_back, color: white),
+                        icon: const Icon(Icons.arrow_back, color: ink),
                       ),
                     ),
                     Icon(
                       widget.role == UserRole.teacher
                           ? Icons.cast_for_education_rounded
                           : Icons.school_rounded,
-                      color: aquamarine,
+                      color: brandOrange,
                       size: 54,
                     ),
                     const SizedBox(height: 12),
@@ -633,7 +634,7 @@ class _RoleAuthScreenState extends State<RoleAuthScreen> {
                       '$roleName ${isSignUp ? 'Sign Up' : 'Login'}',
                       textAlign: TextAlign.center,
                       style: const TextStyle(
-                        color: white,
+                        color: ink,
                         fontSize: 27,
                         fontWeight: FontWeight.bold,
                       ),
@@ -642,10 +643,7 @@ class _RoleAuthScreenState extends State<RoleAuthScreen> {
                     Text(
                       emailRuleMessage,
                       textAlign: TextAlign.center,
-                      style: TextStyle(
-                        color: white.withValues(alpha: 0.8),
-                        fontSize: 13,
-                      ),
+                      style: TextStyle(color: mutedInk, fontSize: 13),
                     ),
                     const SizedBox(height: 28),
                     glassTextField(
@@ -665,7 +663,7 @@ class _RoleAuthScreenState extends State<RoleAuthScreen> {
                           hidePassword
                               ? Icons.visibility_outlined
                               : Icons.visibility_off_outlined,
-                          color: white,
+                          color: ink,
                         ),
                         onPressed: () {
                           setState(() => hidePassword = !hidePassword);
@@ -677,15 +675,16 @@ class _RoleAuthScreenState extends State<RoleAuthScreen> {
                       Row(
                         crossAxisAlignment: CrossAxisAlignment.start,
                         children: [
-                          const Icon(Icons.security, color: aquamarine, size: 18),
+                          const Icon(
+                            Icons.security,
+                            color: brandOrange,
+                            size: 18,
+                          ),
                           const SizedBox(width: 8),
                           Expanded(
                             child: Text(
                               'After your first sign-in, this phone will ask you to enable face, fingerprint, or screen-lock authentication.',
-                              style: TextStyle(
-                                color: white.withValues(alpha: 0.8),
-                                fontSize: 12,
-                              ),
+                              style: TextStyle(color: mutedInk, fontSize: 12),
                             ),
                           ),
                         ],
@@ -698,12 +697,16 @@ class _RoleAuthScreenState extends State<RoleAuthScreen> {
                       child: DecoratedBox(
                         decoration: BoxDecoration(
                           gradient: const LinearGradient(
-                            colors: [Color(0xFF13C8D2), Color(0xFF377FAF)],
+                            colors: [brandOrange, Color(0xFFAA4709)],
                           ),
-                          borderRadius: BorderRadius.circular(30),
-                          border: Border.all(
-                            color: white.withValues(alpha: 0.8),
-                          ),
+                          borderRadius: BorderRadius.circular(AppRadii.pill),
+                          boxShadow: const [
+                            BoxShadow(
+                              color: Color(0x33E56F1F),
+                              blurRadius: 15,
+                              offset: Offset(0, 6),
+                            ),
+                          ],
                         ),
                         child: ElevatedButton(
                           onPressed: isLoading
@@ -714,26 +717,28 @@ class _RoleAuthScreenState extends State<RoleAuthScreen> {
                             disabledBackgroundColor: Colors.transparent,
                             shadowColor: Colors.transparent,
                             shape: RoundedRectangleBorder(
-                              borderRadius: BorderRadius.circular(30),
+                              borderRadius: BorderRadius.circular(
+                                AppRadii.pill,
+                              ),
                             ),
                           ),
                           child: isLoading
                               ? const SizedBox(
-                            height: 23,
-                            width: 23,
-                            child: CircularProgressIndicator(
-                              color: white,
-                              strokeWidth: 2,
-                            ),
-                          )
+                                  height: 23,
+                                  width: 23,
+                                  child: CircularProgressIndicator(
+                                    color: white,
+                                    strokeWidth: 2,
+                                  ),
+                                )
                               : Text(
-                            isSignUp ? 'CREATE ACCOUNT' : 'SIGN IN',
-                            style: const TextStyle(
-                              color: white,
-                              fontWeight: FontWeight.bold,
-                              fontSize: 16,
-                            ),
-                          ),
+                                  isSignUp ? 'CREATE ACCOUNT' : 'SIGN IN',
+                                  style: const TextStyle(
+                                    color: white,
+                                    fontWeight: FontWeight.bold,
+                                    fontSize: 16,
+                                  ),
+                                ),
                         ),
                       ),
                     ),
@@ -747,7 +752,7 @@ class _RoleAuthScreenState extends State<RoleAuthScreen> {
                             ? 'Already have an account? Sign in'
                             : "Don't have an account? Sign up",
                         style: const TextStyle(
-                          color: aquamarine,
+                          color: brandOrange,
                           fontWeight: FontWeight.bold,
                         ),
                       ),
@@ -774,27 +779,12 @@ class _RoleAuthScreenState extends State<RoleAuthScreen> {
       controller: controller,
       keyboardType: keyboardType,
       obscureText: obscureText,
-      style: const TextStyle(color: white, fontSize: 15),
-      cursorColor: aquamarine,
+      style: const TextStyle(color: ink, fontSize: 15),
+      cursorColor: brandOrange,
       decoration: InputDecoration(
         hintText: hint,
-        hintStyle: TextStyle(color: white.withValues(alpha: 0.7)),
-        prefixIcon: Icon(icon, color: aquamarine),
+        prefixIcon: Icon(icon, color: brandOrange),
         suffixIcon: suffixIcon,
-        filled: true,
-        fillColor: white.withValues(alpha: 0.08),
-        contentPadding: const EdgeInsets.symmetric(
-          horizontal: 18,
-          vertical: 18,
-        ),
-        enabledBorder: OutlineInputBorder(
-          borderRadius: BorderRadius.circular(16),
-          borderSide: BorderSide(color: white.withValues(alpha: 0.3)),
-        ),
-        focusedBorder: OutlineInputBorder(
-          borderRadius: BorderRadius.circular(16),
-          borderSide: const BorderSide(color: aquamarine, width: 1.5),
-        ),
       ),
     );
   }
@@ -816,7 +806,8 @@ class DeviceAuthSetupScreen extends StatefulWidget {
 
 class _DeviceAuthSetupScreenState extends State<DeviceAuthSetupScreen> {
   bool _isLoading = false;
-  String _status = 'Link this account to this phone before opening the dashboard.';
+  String _status =
+      'Link this account to this phone before opening the dashboard.';
 
   Future<void> _enableDeviceUnlock() async {
     if (_isLoading) return;
@@ -840,7 +831,10 @@ class _DeviceAuthSetupScreenState extends State<DeviceAuthSetupScreen> {
         persistAcrossBackgrounding: true,
       );
       if (!authenticated) {
-        setState(() => _status = 'Setup was cancelled. Retry to enable secure sign-in.');
+        setState(
+          () =>
+              _status = 'Setup was cancelled. Retry to enable secure sign-in.',
+        );
         return;
       }
 
@@ -848,9 +842,8 @@ class _DeviceAuthSetupScreenState extends State<DeviceAuthSetupScreen> {
         userId: widget.userId,
         role: widget.role,
       );
-      await _verifyBoundSupabaseSession(binding).timeout(
-        const Duration(seconds: 20),
-      );
+      await _verifyBoundSupabaseSession(binding)
+          .timeout(const Duration(seconds: 20));
       await DeviceAccountBindingStore.save(binding);
       if (!mounted) return;
       Navigator.of(context).pushAndRemoveUntil(
@@ -861,22 +854,31 @@ class _DeviceAuthSetupScreenState extends State<DeviceAuthSetupScreen> {
       );
     } on DeviceSessionValidationException catch (error) {
       if (mounted) {
-        setState(() => _status = '${error.message} Secure account recovery is required before the dashboard can open.');
+        setState(
+          () => _status =
+              '${error.message} Secure account recovery is required before the dashboard can open.',
+        );
       }
     } on AuthRetryableFetchException catch (error) {
       debugPrint('Supabase setup could not reach the server: ${error.message}');
       if (mounted) {
-        setState(() => _status = 'Supabase could not be reached. Check your connection and retry setup.');
+        setState(
+          () => _status = 'Supabase could not be reached. Check your connection and retry setup.',
+        );
       }
     } on AuthException catch (error) {
       debugPrint('Supabase setup validation failed: ${error.message}');
       if (mounted) {
-        setState(() => _status = 'Supabase could not validate this account. Check your connection and retry setup.');
+        setState(
+          () => _status = 'Supabase could not validate this account. Check your connection and retry setup.',
+        );
       }
     } catch (error) {
       debugPrint('Device unlock setup failed: $error');
       if (mounted) {
-        setState(() => _status = 'Secure setup could not finish. Check your connection and device lock settings, then retry.');
+        setState(
+          () => _status = 'Secure setup could not finish. Check your connection and device lock settings, then retry.',
+        );
       }
     } finally {
       if (mounted) setState(() => _isLoading = false);
@@ -886,39 +888,47 @@ class _DeviceAuthSetupScreenState extends State<DeviceAuthSetupScreen> {
   @override
   Widget build(BuildContext context) {
     return Scaffold(
-      body: OceanBackground(
+      body: AppBackground(
         child: SafeArea(
           child: Center(
             child: SingleChildScrollView(
-              padding: const EdgeInsets.all(24),
-              child: GlassCard(
+              padding: const EdgeInsets.all(AppSpacing.large),
+              child: AppSurfaceCard(
                 child: Column(
                   mainAxisSize: MainAxisSize.min,
                   children: [
-                    const Icon(Icons.phonelink_lock, color: aquamarine, size: 58),
+                    const Icon(
+                      Icons.phonelink_lock,
+                      color: brandOrange,
+                      size: 58,
+                    ),
                     const SizedBox(height: 16),
                     const Text(
                       'Enable secure sign-in',
                       textAlign: TextAlign.center,
-                      style: TextStyle(color: white, fontSize: 25, fontWeight: FontWeight.bold),
+                      style: TextStyle(
+                        color: ink,
+                        fontSize: 25,
+                        fontWeight: FontWeight.bold,
+                      ),
                     ),
                     const SizedBox(height: 10),
                     Text(
                       'This ${widget.role.label.toLowerCase()} account will be linked to this phone. Future openings will show only the device-unlock screen.',
                       textAlign: TextAlign.center,
-                      style: TextStyle(color: white.withValues(alpha: 0.85)),
+                      style: TextStyle(color: mutedInk),
                     ),
                     const SizedBox(height: 14),
                     Text(
                       'Use the face, fingerprint, or PIN, pattern, or password configured in your phone security prompt.',
                       textAlign: TextAlign.center,
-                      style: TextStyle(color: white.withValues(alpha: 0.75), fontSize: 13),
+                      style: TextStyle(color: mutedInk, fontSize: 13),
                     ),
                     const SizedBox(height: 12),
                     Text(
                       _status,
                       textAlign: TextAlign.center,
-                      style: const TextStyle(color: aquamarine),
+                      style: const TextStyle(color: brandOrange),
                     ),
                     const SizedBox(height: 20),
                     SizedBox(
@@ -929,13 +939,17 @@ class _DeviceAuthSetupScreenState extends State<DeviceAuthSetupScreen> {
                             ? const SizedBox(
                                 width: 18,
                                 height: 18,
-                                child: CircularProgressIndicator(strokeWidth: 2),
+                                child: CircularProgressIndicator(
+                                  strokeWidth: 2,
+                                ),
                               )
                             : const Icon(Icons.lock_open),
-                        label: Text(_isLoading ? 'SETTING UP...' : 'ENABLE DEVICE UNLOCK'),
+                        label: Text(
+                          _isLoading ? 'SETTING UP...' : 'ENABLE DEVICE UNLOCK',
+                        ),
                         style: ElevatedButton.styleFrom(
-                          backgroundColor: aquamarine,
-                          foregroundColor: deepNavy,
+                          backgroundColor: brandOrange,
+                          foregroundColor: white,
                           padding: const EdgeInsets.symmetric(vertical: 15),
                         ),
                       ),
@@ -979,13 +993,15 @@ class _DeviceUnlockScreenState extends State<DeviceUnlockScreen> {
         persistAcrossBackgrounding: true,
       );
       if (!authenticated) {
-        setState(() => _status = 'Authentication failed or was cancelled. You can retry.');
+        setState(
+          () => _status =
+              'Authentication failed or was cancelled. You can retry.',
+        );
         return;
       }
 
-      await _verifyBoundSupabaseSession(widget.binding).timeout(
-        const Duration(seconds: 20),
-      );
+      await _verifyBoundSupabaseSession(widget.binding)
+          .timeout(const Duration(seconds: 20));
       if (!mounted) return;
       Navigator.of(context).pushAndRemoveUntil(
         MaterialPageRoute<void>(
@@ -996,10 +1012,13 @@ class _DeviceUnlockScreenState extends State<DeviceUnlockScreen> {
     } on DeviceSessionValidationException catch (error) {
       if (!mounted) return;
       setState(() {
-        _status = '${error.message} Secure account recovery is required; the dashboard remains locked.';
+        _status =
+            '${error.message} Secure account recovery is required; the dashboard remains locked.';
       });
     } on AuthRetryableFetchException catch (error) {
-      debugPrint('Supabase unlock could not reach the server: ${error.message}');
+      debugPrint(
+        'Supabase unlock could not reach the server: ${error.message}',
+      );
       if (!mounted) return;
       setState(() {
         _status = 'Supabase could not be reached to validate the session. Check your connection and retry.';
@@ -1029,27 +1048,31 @@ class _DeviceUnlockScreenState extends State<DeviceUnlockScreen> {
   @override
   Widget build(BuildContext context) {
     return Scaffold(
-      body: OceanBackground(
+      body: AppBackground(
         child: SafeArea(
           child: Center(
             child: Padding(
-              padding: const EdgeInsets.all(24),
-              child: GlassCard(
+              padding: const EdgeInsets.all(AppSpacing.large),
+              child: AppSurfaceCard(
                 child: Column(
                   mainAxisSize: MainAxisSize.min,
                   children: [
-                    const Icon(Icons.lock_person, color: aquamarine, size: 64),
+                    const Icon(Icons.lock_person, color: brandOrange, size: 64),
                     const SizedBox(height: 16),
                     const Text(
                       'Welcome back',
                       textAlign: TextAlign.center,
-                      style: TextStyle(color: white, fontSize: 27, fontWeight: FontWeight.bold),
+                      style: TextStyle(
+                        color: ink,
+                        fontSize: 27,
+                        fontWeight: FontWeight.bold,
+                      ),
                     ),
                     const SizedBox(height: 8),
                     Text(
                       '${widget.binding.role.label} account on this device',
                       textAlign: TextAlign.center,
-                      style: TextStyle(color: white.withValues(alpha: 0.82)),
+                      style: TextStyle(color: mutedInk),
                     ),
                     const SizedBox(height: 16),
                     Text(
@@ -1057,7 +1080,7 @@ class _DeviceUnlockScreenState extends State<DeviceUnlockScreen> {
                           ? 'Unlock with your saved face, fingerprint, or phone screen lock.'
                           : _status,
                       textAlign: TextAlign.center,
-                      style: const TextStyle(color: aquamarine),
+                      style: const TextStyle(color: brandOrange),
                     ),
                     const SizedBox(height: 22),
                     SizedBox(
@@ -1068,13 +1091,17 @@ class _DeviceUnlockScreenState extends State<DeviceUnlockScreen> {
                             ? const SizedBox(
                                 width: 18,
                                 height: 18,
-                                child: CircularProgressIndicator(strokeWidth: 2),
+                                child: CircularProgressIndicator(
+                                  strokeWidth: 2,
+                                ),
                               )
                             : const Icon(Icons.lock_open),
-                        label: Text(_isLoading ? 'VERIFYING...' : 'UNLOCK THIS DEVICE'),
+                        label: Text(
+                          _isLoading ? 'VERIFYING...' : 'UNLOCK THIS DEVICE',
+                        ),
                         style: ElevatedButton.styleFrom(
-                          backgroundColor: aquamarine,
-                          foregroundColor: deepNavy,
+                          backgroundColor: brandOrange,
+                          foregroundColor: white,
                           padding: const EdgeInsets.symmetric(vertical: 15),
                         ),
                       ),
@@ -1098,27 +1125,31 @@ class SessionRecoveryScreen extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     return Scaffold(
-      body: OceanBackground(
+      body: AppBackground(
         child: SafeArea(
           child: Center(
             child: Padding(
-              padding: const EdgeInsets.all(24),
-              child: GlassCard(
+              padding: const EdgeInsets.all(AppSpacing.large),
+              child: AppSurfaceCard(
                 child: Column(
                   mainAxisSize: MainAxisSize.min,
                   children: [
-                    const Icon(Icons.lock_reset, color: aquamarine, size: 58),
+                    const Icon(Icons.lock_reset, color: brandOrange, size: 58),
                     const SizedBox(height: 16),
                     const Text(
                       'Secure sign-in needs recovery',
                       textAlign: TextAlign.center,
-                      style: TextStyle(color: white, fontSize: 23, fontWeight: FontWeight.bold),
+                      style: TextStyle(
+                        color: ink,
+                        fontSize: 23,
+                        fontWeight: FontWeight.bold,
+                      ),
                     ),
                     const SizedBox(height: 12),
                     Text(
                       '$message No dashboard will open until Supabase sign-in is valid again.',
                       textAlign: TextAlign.center,
-                      style: TextStyle(color: white.withValues(alpha: 0.85)),
+                      style: TextStyle(color: mutedInk),
                     ),
                   ],
                 ),
@@ -1147,17 +1178,17 @@ class DashboardScreen extends StatelessWidget {
         foregroundColor: white,
         actions: const [],
       ),
-      body: OceanBackground(
+      body: AppBackground(
         child: Center(
           child: Padding(
-            padding: const EdgeInsets.all(24),
-            child: GlassCard(
+            padding: const EdgeInsets.all(AppSpacing.large),
+            child: AppSurfaceCard(
               child: Column(
                 mainAxisSize: MainAxisSize.min,
                 children: [
                   Icon(
                     isTeacher ? Icons.cast_for_education : Icons.school,
-                    color: aquamarine,
+                    color: brandOrange,
                     size: 60,
                   ),
                   const SizedBox(height: 18),
@@ -1165,7 +1196,7 @@ class DashboardScreen extends StatelessWidget {
                     'Welcome, ${role.label}!',
                     textAlign: TextAlign.center,
                     style: const TextStyle(
-                      color: white,
+                      color: ink,
                       fontSize: 26,
                       fontWeight: FontWeight.bold,
                     ),
@@ -1176,20 +1207,21 @@ class DashboardScreen extends StatelessWidget {
                         ? 'Your teacher dashboard is ready. Attendance management features can be added here.'
                         : 'Your student dashboard is ready. Attendance viewing and marking features can be added here.',
                     textAlign: TextAlign.center,
-                    style: TextStyle(
-                      color: white.withValues(alpha: 0.88),
-                      fontSize: 15,
-                    ),
+                    style: TextStyle(color: mutedInk, fontSize: 15),
                   ),
                   const SizedBox(height: 24),
                   SizedBox(
                     width: double.infinity,
                     child: ElevatedButton.icon(
-                      icon: Icon(isTeacher ? Icons.bluetooth_searching : Icons.bluetooth),
-                      label: Text(isTeacher ? 'Start BLE Attendance' : 'Find Teacher'),
+                      icon: Icon(
+                        isTeacher ? Icons.bluetooth_searching : Icons.bluetooth,
+                      ),
+                      label: Text(
+                        isTeacher ? 'Start BLE Attendance' : 'Find Teacher',
+                      ),
                       style: ElevatedButton.styleFrom(
-                        backgroundColor: aquamarine,
-                        foregroundColor: deepNavy,
+                        backgroundColor: brandOrange,
+                        foregroundColor: white,
                         padding: const EdgeInsets.symmetric(vertical: 15),
                       ),
                       onPressed: () {
@@ -1213,101 +1245,3 @@ class DashboardScreen extends StatelessWidget {
     );
   }
 }
-
-class OceanBackground extends StatelessWidget {
-  final Widget child;
-
-  const OceanBackground({super.key, required this.child});
-
-  Widget _glowCircle(double size, Color color) {
-    return Container(
-      width: size,
-      height: size,
-      decoration: BoxDecoration(
-        shape: BoxShape.circle,
-        color: color.withValues(alpha: 0.3),
-        boxShadow: [
-          BoxShadow(
-            color: color.withValues(alpha: 0.35),
-            blurRadius: 100,
-            spreadRadius: 20,
-          ),
-        ],
-      ),
-    );
-  }
-
-  @override
-  Widget build(BuildContext context) {
-    return Container(
-      width: double.infinity,
-      height: double.infinity,
-      decoration: const BoxDecoration(
-        gradient: LinearGradient(
-          begin: Alignment.topLeft,
-          end: Alignment.bottomRight,
-          colors: [
-            midnightBlue,
-            deepNavy,
-            Color(0xFF006B8F),
-            Color(0xFF08B9C5),
-            deepNavy,
-          ],
-          stops: [0.0, 0.28, 0.55, 0.72, 1.0],
-        ),
-      ),
-      child: Stack(
-        children: [
-          Positioned(
-            top: 100,
-            right: -100,
-            child: _glowCircle(300, const Color(0xFF00D9E8)),
-          ),
-          Positioned(
-            bottom: 50,
-            left: -120,
-            child: _glowCircle(280, const Color(0xFF00AFC1)),
-          ),
-          child,
-        ],
-      ),
-    );
-  }
-}
-
-class GlassCard extends StatelessWidget {
-  final Widget child;
-
-  const GlassCard({super.key, required this.child});
-
-  @override
-  Widget build(BuildContext context) {
-    return ClipRRect(
-      borderRadius: BorderRadius.circular(28),
-      child: BackdropFilter(
-        filter: ImageFilter.blur(sigmaX: 18, sigmaY: 18),
-        child: Container(
-          width: 440,
-          padding: const EdgeInsets.symmetric(horizontal: 24, vertical: 24),
-          decoration: BoxDecoration(
-            color: white.withValues(alpha: 0.13),
-            borderRadius: BorderRadius.circular(28),
-            border: Border.all(
-              color: white.withValues(alpha: 0.65),
-              width: 1.4,
-            ),
-            boxShadow: [
-              BoxShadow(
-                color: Colors.black.withValues(alpha: 0.12),
-                blurRadius: 30,
-                spreadRadius: 2,
-              ),
-            ],
-          ),
-          child: child,
-        ),
-      ),
-    );
-  }
-}
-
