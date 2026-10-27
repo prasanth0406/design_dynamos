@@ -1,16 +1,79 @@
+import 'dart:async';
+import 'dart:convert';
 import 'dart:ui';
 
 import 'package:flutter/material.dart';
 import 'package:local_auth/local_auth.dart';
+import 'package:flutter_secure_storage/flutter_secure_storage.dart';
 import 'attendance_screen.dart';
 import 'package:supabase_flutter/supabase_flutter.dart';
+
+const String supabaseProjectUrl = 'https://otfazpvwsxintyzcytvx.supabase.co';
+const String supabasePublishableKey = 'sb_publishable_dy9LkmDGDwFVHTzGdiqnbA_CwKgVJKZ';
+const String _secureSupabaseSessionKey = 'oceanic_supabase_session_v1';
+const String _deviceBindingKey = 'oceanic_device_account_binding_v1';
+const String _legacySupabaseSessionKey = 'sb-otfazpvwsxintyzcytvx-auth-token';
+
+final FlutterSecureStorage _secureStorage = FlutterSecureStorage();
+
+/// Stores Supabase's refresh/access tokens encrypted on this device.
+/// Existing SharedPreferences sessions are migrated once to avoid forcing users
+/// to sign in again after upgrading this app.
+class SecureSupabaseLocalStorage extends LocalStorage {
+  SecureSupabaseLocalStorage()
+      : _legacyStorage = SharedPreferencesLocalStorage(
+          persistSessionKey: _legacySupabaseSessionKey,
+        );
+
+  final SharedPreferencesLocalStorage _legacyStorage;
+
+  @override
+  Future<void> initialize() async {
+    await _legacyStorage.initialize();
+    final secureSession = await _secureStorage.read(
+      key: _secureSupabaseSessionKey,
+    );
+    if (secureSession == null) {
+      final legacySession = await _legacyStorage.accessToken();
+      if (legacySession != null) {
+        await _secureStorage.write(
+          key: _secureSupabaseSessionKey,
+          value: legacySession,
+        );
+      }
+    }
+    await _legacyStorage.removePersistedSession();
+  }
+
+  @override
+  Future<bool> hasAccessToken() async =>
+      await _secureStorage.read(key: _secureSupabaseSessionKey) != null;
+
+  @override
+  Future<String?> accessToken() =>
+      _secureStorage.read(key: _secureSupabaseSessionKey);
+
+  @override
+  Future<void> removePersistedSession() =>
+      _secureStorage.delete(key: _secureSupabaseSessionKey);
+
+  @override
+  Future<void> persistSession(String persistSessionString) =>
+      _secureStorage.write(
+        key: _secureSupabaseSessionKey,
+        value: persistSessionString,
+      );
+}
 
 Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
 
   await Supabase.initialize(
-    url: 'https://otfazpvwsxintyzcytvx.supabase.co',
-    publishableKey: 'sb_publishable_dy9LkmDGDwFVHTzGdiqnbA_CwKgVJKZ',
+    url: supabaseProjectUrl,
+    publishableKey: supabasePublishableKey,
+    authOptions: FlutterAuthClientOptions(
+      localStorage: SecureSupabaseLocalStorage(),
+    ),
   );
 
   runApp(const MyApp());
@@ -29,6 +92,153 @@ extension UserRoleLabel on UserRole {
   String get value => this == UserRole.student ? 'student' : 'teacher';
 }
 
+UserRole? _userRoleFromValue(Object? value) {
+  final normalized = value?.toString().toLowerCase();
+  for (final role in UserRole.values) {
+    if (role.value == normalized) return role;
+  }
+  return null;
+}
+
+class DeviceAccountBinding {
+  const DeviceAccountBinding({required this.userId, required this.role});
+
+  final String userId;
+  final UserRole role;
+
+  String encode() => jsonEncode({'userId': userId, 'role': role.value});
+
+  static DeviceAccountBinding decode(String raw) {
+    final decoded = jsonDecode(raw);
+    if (decoded is! Map<String, dynamic>) {
+      throw const FormatException('Invalid device account binding.');
+    }
+    final userId = decoded['userId'];
+    final role = _userRoleFromValue(decoded['role']);
+    if (userId is! String || userId.isEmpty || role == null) {
+      throw const FormatException('Invalid device account binding.');
+    }
+    return DeviceAccountBinding(userId: userId, role: role);
+  }
+}
+
+class DeviceAccountBindingStore {
+  static Future<DeviceAccountBinding?> read() async {
+    final encoded = await _secureStorage.read(key: _deviceBindingKey);
+    return encoded == null ? null : DeviceAccountBinding.decode(encoded);
+  }
+
+  static Future<void> save(DeviceAccountBinding binding) =>
+      _secureStorage.write(key: _deviceBindingKey, value: binding.encode());
+
+  static Future<void> clear() =>
+      _secureStorage.delete(key: _deviceBindingKey);
+}
+
+class DeviceSessionValidationException implements Exception {
+  const DeviceSessionValidationException(this.message);
+
+  final String message;
+
+  @override
+  String toString() => message;
+}
+
+/// Refreshes an expired session, validates it with Supabase, and ensures the
+/// authenticated user and role still match this device's secure binding.
+Future<User> _verifyBoundSupabaseSession(DeviceAccountBinding binding) async {
+  final auth = Supabase.instance.client.auth;
+  if (auth.currentSession == null) {
+    throw const DeviceSessionValidationException(
+      'No saved Supabase session is available on this device.',
+    );
+  }
+
+  // Refresh on every unlock so a revoked refresh token is rejected before the
+  // app opens, even if the locally cached access JWT has not expired yet.
+  final session = (await auth.refreshSession()).session;
+  if (session == null || session.user.id != binding.userId) {
+    throw const DeviceSessionValidationException(
+      'The saved Supabase session no longer matches this device account.',
+    );
+  }
+
+  final user = (await auth.getUser()).user;
+  if (user == null) {
+    throw const DeviceSessionValidationException(
+      'Supabase did not return a valid account for this session.',
+    );
+  }
+  if (user.id != binding.userId ||
+      _userRoleFromValue(user.userMetadata?['role']) != binding.role) {
+    throw const DeviceSessionValidationException(
+      'The saved Supabase account or role is no longer valid for this device.',
+    );
+  }
+  return user;
+}
+
+class SecureStartupRouter extends StatefulWidget {
+  const SecureStartupRouter({super.key});
+
+  @override
+  State<SecureStartupRouter> createState() => _SecureStartupRouterState();
+}
+
+class _SecureStartupRouterState extends State<SecureStartupRouter> {
+  late final Future<Widget> _startupScreen = _resolveStartupScreen();
+
+  Future<Widget> _resolveStartupScreen() async {
+    final binding = await DeviceAccountBindingStore.read();
+    final session = Supabase.instance.client.auth.currentSession;
+
+    if (binding != null) {
+      if (session == null) {
+        return const SessionRecoveryScreen(
+          message: 'The saved Supabase session is missing or expired. Reauthenticate to use this account.',
+        );
+      }
+      if (session.user.id != binding.userId) {
+        return const SessionRecoveryScreen(
+          message: 'The saved Supabase account does not match this device binding. Reauthenticate to recover access.',
+        );
+      }
+      return DeviceUnlockScreen(binding: binding);
+    }
+
+    if (session != null) {
+      final role = _userRoleFromValue(session.user.userMetadata?['role']);
+      if (role == null) {
+        return const SessionRecoveryScreen(
+          message: 'This Supabase account has no valid attendance role. Sign out and reauthenticate to recover access.',
+        );
+      }
+      return DeviceAuthSetupScreen(userId: session.user.id, role: role);
+    }
+
+    return const RoleSelectionScreen();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return FutureBuilder<Widget>(
+      future: _startupScreen,
+      builder: (context, snapshot) {
+        if (snapshot.hasData) return snapshot.data!;
+        if (snapshot.hasError) {
+          return const SessionRecoveryScreen(
+            message: 'Secure device sign-in could not be read. Use account recovery to sign in again.',
+          );
+        }
+        return const Scaffold(
+          backgroundColor: deepNavy,
+          body: Center(child: CircularProgressIndicator(color: aquamarine)),
+        );
+      },
+    );
+  }
+}
+
 class MyApp extends StatelessWidget {
   const MyApp({super.key});
 
@@ -42,7 +252,7 @@ class MyApp extends StatelessWidget {
         fontFamily: 'Roboto',
         colorScheme: ColorScheme.fromSeed(seedColor: aquamarine),
       ),
-      home: const RoleSelectionScreen(),
+      home: const SecureStartupRouter(),
     );
   }
 }
@@ -238,38 +448,18 @@ class _RoleAuthScreenState extends State<RoleAuthScreen> {
   bool isLoading = false;
   bool isSignUp = false;
 
-  final LocalAuthentication _localAuth = LocalAuthentication();
-
-  /// Uses the phone's available biometric and permits its screen-lock fallback.
-  /// Supabase still verifies the account after local device authentication.
-  Future<bool> authenticateWithDeviceSecurity() async {
+  Future<bool> _blockIfDeviceIsAlreadyBound() async {
     try {
-      final bool isDeviceSupported = await _localAuth.isDeviceSupported();
-      if (!isDeviceSupported) {
-        showMessage('Set up face unlock, a fingerprint, or a phone screen lock first.');
-        return false;
-      }
-
-      final bool authenticated = await _localAuth.authenticate(
-        localizedReason: 'Verify with face, fingerprint, or your phone screen lock.',
-        // False allows Android to offer the device PIN, pattern, or password.
-        biometricOnly: false,
-        persistAcrossBackgrounding: true,
+      if (await DeviceAccountBindingStore.read() == null) return false;
+      showMessage(
+        'This phone is already linked to an account. Use the unlock screen or account recovery.',
       );
-
-      if (!authenticated) {
-        showMessage('Device verification was cancelled or failed.');
-      }
-      return authenticated;
-    } on LocalAuthException catch (error) {
-      debugPrint('Local authentication error: ${error.code}');
-      showMessage('Device verification failed. Try face, fingerprint, or phone lock again.');
-      return false;
-    } catch (error) {
-      debugPrint('Unexpected local authentication error: $error');
-      showMessage('Unable to start device verification on this phone.');
-      return false;
+    } catch (_) {
+      showMessage(
+        'The secure device binding could not be read. Use account recovery to continue.',
+      );
     }
+    return true;
   }
 
   @override
@@ -297,6 +487,8 @@ class _RoleAuthScreenState extends State<RoleAuthScreen> {
   }
 
   Future<void> signUp() async {
+    if (await _blockIfDeviceIsAlreadyBound()) return;
+
     final email = emailController.text.trim().toLowerCase();
     final password = passwordController.text;
 
@@ -325,8 +517,12 @@ class _RoleAuthScreenState extends State<RoleAuthScreen> {
       if (!mounted) return;
 
       if (response.session != null) {
-        showMessage('Account created successfully. You can now continue.');
-        _openDashboard(widget.role);
+        final user = response.user;
+        if (user == null) {
+          showMessage('Account was created, but secure setup could not start. Sign in to continue.');
+          return;
+        }
+        _openDeviceSetup(user.id, widget.role);
       } else {
         showMessage(
           'Signup submitted. Check your college email to confirm your account, then log in.',
@@ -343,6 +539,8 @@ class _RoleAuthScreenState extends State<RoleAuthScreen> {
   }
 
   Future<void> signIn() async {
+    if (await _blockIfDeviceIsAlreadyBound()) return;
+
     final email = emailController.text.trim().toLowerCase();
     final password = passwordController.text;
 
@@ -358,10 +556,6 @@ class _RoleAuthScreenState extends State<RoleAuthScreen> {
     setState(() => isLoading = true);
 
     try {
-      // Verify locally before asking Supabase to authenticate the account.
-      final deviceVerified = await authenticateWithDeviceSecurity();
-      if (!deviceVerified) return;
-
       final response = await Supabase.instance.client.auth.signInWithPassword(
         email: email,
         password: password,
@@ -385,7 +579,7 @@ class _RoleAuthScreenState extends State<RoleAuthScreen> {
       }
 
       if (!mounted) return;
-      _openDashboard(widget.role);
+      _openDeviceSetup(user.id, widget.role);
     } on AuthException catch (error) {
       showMessage(error.message);
     } catch (_) {
@@ -395,13 +589,14 @@ class _RoleAuthScreenState extends State<RoleAuthScreen> {
     }
   }
 
-  void _openDashboard(UserRole role) {
+  void _openDeviceSetup(String userId, UserRole role) {
     if (!mounted) return;
-    Navigator.pushReplacement(
+    Navigator.pushAndRemoveUntil(
       context,
       MaterialPageRoute(
-        builder: (_) => DashboardScreen(role: role),
+        builder: (_) => DeviceAuthSetupScreen(userId: userId, role: role),
       ),
+      (route) => false,
     );
   }
 
@@ -486,7 +681,7 @@ class _RoleAuthScreenState extends State<RoleAuthScreen> {
                           const SizedBox(width: 8),
                           Expanded(
                             child: Text(
-                              'Verify with face or fingerprint. You can use your phone PIN, pattern, or password from the system prompt.',
+                              'After your first sign-in, this phone will ask you to enable face, fingerprint, or screen-lock authentication.',
                               style: TextStyle(
                                 color: white.withValues(alpha: 0.8),
                                 fontSize: 12,
@@ -605,19 +800,429 @@ class _RoleAuthScreenState extends State<RoleAuthScreen> {
   }
 }
 
+Future<void> _signOutAndReturnToRoleSelection(BuildContext context) async {
+  try {
+    await Supabase.instance.client.auth.signOut(scope: SignOutScope.local);
+    await DeviceAccountBindingStore.clear();
+    if (!context.mounted) return;
+    Navigator.of(context).pushAndRemoveUntil(
+      MaterialPageRoute<void>(builder: (_) => const RoleSelectionScreen()),
+      (route) => false,
+    );
+  } catch (error) {
+    if (!context.mounted) return;
+    ScaffoldMessenger.of(context).showSnackBar(
+      const SnackBar(
+        content: Text('Sign out could not finish. This device remains locked to its account.'),
+        behavior: SnackBarBehavior.floating,
+      ),
+    );
+    debugPrint('Secure sign-out failed: $error');
+  }
+}
+
+Future<void> _confirmSignOutAndReturn(BuildContext context) async {
+  final shouldSignOut = await showDialog<bool>(
+    context: context,
+    builder: (dialogContext) => AlertDialog(
+      title: const Text('Sign out and unlink this device?'),
+      content: const Text(
+        'This clears the saved account on this phone. The next sign-in will require your Supabase email and password, then device unlock setup again.',
+      ),
+      actions: [
+        TextButton(
+          onPressed: () => Navigator.pop(dialogContext, false),
+          child: const Text('CANCEL'),
+        ),
+        FilledButton(
+          onPressed: () => Navigator.pop(dialogContext, true),
+          child: const Text('SIGN OUT'),
+        ),
+      ],
+    ),
+  );
+  if (shouldSignOut == true && context.mounted) {
+    await _signOutAndReturnToRoleSelection(context);
+  }
+}
+
+class DeviceAuthSetupScreen extends StatefulWidget {
+  const DeviceAuthSetupScreen({
+    super.key,
+    required this.userId,
+    required this.role,
+  });
+
+  final String userId;
+  final UserRole role;
+
+  @override
+  State<DeviceAuthSetupScreen> createState() => _DeviceAuthSetupScreenState();
+}
+
+class _DeviceAuthSetupScreenState extends State<DeviceAuthSetupScreen> {
+  bool _isLoading = false;
+  String _status = 'Link this account to this phone before opening the dashboard.';
+
+  Future<void> _enableDeviceUnlock() async {
+    if (_isLoading) return;
+    setState(() {
+      _isLoading = true;
+      _status = 'Confirm your face, fingerprint, or phone screen lock.';
+    });
+
+    try {
+      final localAuth = LocalAuthentication();
+      if (!await localAuth.isDeviceSupported()) {
+        setState(() {
+          _status = 'Set up face unlock, a fingerprint, or a PIN, pattern, or password in phone settings, then retry.';
+        });
+        return;
+      }
+
+      final authenticated = await localAuth.authenticate(
+        localizedReason: 'Enable secure sign-in for Oceanic Attendance.',
+        biometricOnly: false,
+        persistAcrossBackgrounding: true,
+      );
+      if (!authenticated) {
+        setState(() => _status = 'Setup was cancelled. Retry to enable secure sign-in.');
+        return;
+      }
+
+      final binding = DeviceAccountBinding(
+        userId: widget.userId,
+        role: widget.role,
+      );
+      await _verifyBoundSupabaseSession(binding).timeout(
+        const Duration(seconds: 20),
+      );
+      await DeviceAccountBindingStore.save(binding);
+      if (!mounted) return;
+      Navigator.of(context).pushAndRemoveUntil(
+        MaterialPageRoute<void>(
+          builder: (_) => DashboardScreen(role: widget.role),
+        ),
+        (route) => false,
+      );
+    } on DeviceSessionValidationException catch (error) {
+      if (mounted) {
+        setState(() => _status = '${error.message} Sign out and reauthenticate to recover access.');
+      }
+    } on AuthRetryableFetchException catch (error) {
+      debugPrint('Supabase setup could not reach the server: ${error.message}');
+      if (mounted) {
+        setState(() => _status = 'Supabase could not be reached. Check your connection and retry setup.');
+      }
+    } on AuthException catch (error) {
+      debugPrint('Supabase setup validation failed: ${error.message}');
+      if (mounted) {
+        setState(() => _status = 'Supabase could not validate this account. Check your connection and retry, or sign out and reauthenticate.');
+      }
+    } catch (error) {
+      debugPrint('Device unlock setup failed: $error');
+      if (mounted) {
+        setState(() => _status = 'Secure setup could not finish. Check your connection and device lock settings, then retry.');
+      }
+    } finally {
+      if (mounted) setState(() => _isLoading = false);
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      body: OceanBackground(
+        child: SafeArea(
+          child: Center(
+            child: SingleChildScrollView(
+              padding: const EdgeInsets.all(24),
+              child: GlassCard(
+                child: Column(
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    const Icon(Icons.phonelink_lock, color: aquamarine, size: 58),
+                    const SizedBox(height: 16),
+                    const Text(
+                      'Enable secure sign-in',
+                      textAlign: TextAlign.center,
+                      style: TextStyle(color: white, fontSize: 25, fontWeight: FontWeight.bold),
+                    ),
+                    const SizedBox(height: 10),
+                    Text(
+                      'This ${widget.role.label.toLowerCase()} account will be linked to this phone. Future openings will show only the device-unlock screen.',
+                      textAlign: TextAlign.center,
+                      style: TextStyle(color: white.withValues(alpha: 0.85)),
+                    ),
+                    const SizedBox(height: 14),
+                    Text(
+                      'Use the face, fingerprint, or PIN, pattern, or password configured in your phone security prompt.',
+                      textAlign: TextAlign.center,
+                      style: TextStyle(color: white.withValues(alpha: 0.75), fontSize: 13),
+                    ),
+                    const SizedBox(height: 12),
+                    Text(
+                      _status,
+                      textAlign: TextAlign.center,
+                      style: const TextStyle(color: aquamarine),
+                    ),
+                    const SizedBox(height: 20),
+                    SizedBox(
+                      width: double.infinity,
+                      child: ElevatedButton.icon(
+                        onPressed: _isLoading ? null : _enableDeviceUnlock,
+                        icon: _isLoading
+                            ? const SizedBox(
+                                width: 18,
+                                height: 18,
+                                child: CircularProgressIndicator(strokeWidth: 2),
+                              )
+                            : const Icon(Icons.lock_open),
+                        label: Text(_isLoading ? 'SETTING UP...' : 'ENABLE DEVICE UNLOCK'),
+                        style: ElevatedButton.styleFrom(
+                          backgroundColor: aquamarine,
+                          foregroundColor: deepNavy,
+                          padding: const EdgeInsets.symmetric(vertical: 15),
+                        ),
+                      ),
+                    ),
+                    TextButton(
+                      onPressed: _isLoading
+                          ? null
+                          : () => _confirmSignOutAndReturn(context),
+                      child: const Text('Sign out and use another account'),
+                    ),
+                  ],
+                ),
+              ),
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+class DeviceUnlockScreen extends StatefulWidget {
+  const DeviceUnlockScreen({super.key, required this.binding});
+
+  final DeviceAccountBinding binding;
+
+  @override
+  State<DeviceUnlockScreen> createState() => _DeviceUnlockScreenState();
+}
+
+class _DeviceUnlockScreenState extends State<DeviceUnlockScreen> {
+  bool _isLoading = false;
+  bool _needsRecovery = false;
+  String _status = '';
+
+  Future<void> _unlock() async {
+    if (_isLoading) return;
+    setState(() {
+      _isLoading = true;
+      _needsRecovery = false;
+      _status = 'Waiting for device authentication...';
+    });
+
+    try {
+      final localAuth = LocalAuthentication();
+      final authenticated = await localAuth.authenticate(
+        localizedReason: 'Unlock Oceanic Attendance with this phone.',
+        biometricOnly: false,
+        persistAcrossBackgrounding: true,
+      );
+      if (!authenticated) {
+        setState(() => _status = 'Authentication failed or was cancelled. You can retry.');
+        return;
+      }
+
+      await _verifyBoundSupabaseSession(widget.binding).timeout(
+        const Duration(seconds: 20),
+      );
+      if (!mounted) return;
+      Navigator.of(context).pushAndRemoveUntil(
+        MaterialPageRoute<void>(
+          builder: (_) => DashboardScreen(role: widget.binding.role),
+        ),
+        (route) => false,
+      );
+    } on DeviceSessionValidationException catch (error) {
+      if (!mounted) return;
+      setState(() {
+        _needsRecovery = true;
+        _status = '${error.message} Account recovery or reauthentication is required.';
+      });
+    } on AuthRetryableFetchException catch (error) {
+      debugPrint('Supabase unlock could not reach the server: ${error.message}');
+      if (!mounted) return;
+      setState(() {
+        _status = 'Supabase could not be reached to validate the session. Check your connection and retry.';
+      });
+    } on AuthException catch (error) {
+      debugPrint('Supabase unlock validation failed: ${error.message}');
+      if (!mounted) return;
+      setState(() {
+        _needsRecovery = true;
+        _status = 'Supabase rejected the saved session. Account recovery or reauthentication is required.';
+      });
+    } on TimeoutException {
+      if (!mounted) return;
+      setState(() {
+        _status = 'Supabase could not be reached to validate the session. Check your connection and retry.';
+      });
+    } catch (error) {
+      debugPrint('Device unlock failed: $error');
+      if (!mounted) return;
+      setState(() {
+        _status = 'The saved session could not be verified. Check your connection and retry.';
+      });
+    } finally {
+      if (mounted) setState(() => _isLoading = false);
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      body: OceanBackground(
+        child: SafeArea(
+          child: Center(
+            child: Padding(
+              padding: const EdgeInsets.all(24),
+              child: GlassCard(
+                child: Column(
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    const Icon(Icons.lock_person, color: aquamarine, size: 64),
+                    const SizedBox(height: 16),
+                    const Text(
+                      'Welcome back',
+                      textAlign: TextAlign.center,
+                      style: TextStyle(color: white, fontSize: 27, fontWeight: FontWeight.bold),
+                    ),
+                    const SizedBox(height: 8),
+                    Text(
+                      '${widget.binding.role.label} account on this device',
+                      textAlign: TextAlign.center,
+                      style: TextStyle(color: white.withValues(alpha: 0.82)),
+                    ),
+                    const SizedBox(height: 16),
+                    Text(
+                      _status.isEmpty
+                          ? 'Unlock with your saved face, fingerprint, or phone screen lock.'
+                          : _status,
+                      textAlign: TextAlign.center,
+                      style: const TextStyle(color: aquamarine),
+                    ),
+                    const SizedBox(height: 22),
+                    SizedBox(
+                      width: double.infinity,
+                      child: ElevatedButton.icon(
+                        onPressed: _isLoading ? null : _unlock,
+                        icon: _isLoading
+                            ? const SizedBox(
+                                width: 18,
+                                height: 18,
+                                child: CircularProgressIndicator(strokeWidth: 2),
+                              )
+                            : const Icon(Icons.lock_open),
+                        label: Text(_isLoading ? 'VERIFYING...' : 'UNLOCK THIS DEVICE'),
+                        style: ElevatedButton.styleFrom(
+                          backgroundColor: aquamarine,
+                          foregroundColor: deepNavy,
+                          padding: const EdgeInsets.symmetric(vertical: 15),
+                        ),
+                      ),
+                    ),
+                    if (_needsRecovery) ...[
+                      const SizedBox(height: 8),
+                      const Text(
+                        'Your dashboard stays locked until the Supabase account is recovered.',
+                        textAlign: TextAlign.center,
+                        style: TextStyle(color: Colors.white70),
+                      ),
+                      const SizedBox(height: 8),
+                      TextButton(
+                        onPressed: _isLoading
+                            ? null
+                            : () => _confirmSignOutAndReturn(context),
+                        child: const Text('Account recovery / sign out'),
+                      ),
+                    ],
+                  ],
+                ),
+              ),
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+class SessionRecoveryScreen extends StatelessWidget {
+  const SessionRecoveryScreen({super.key, required this.message});
+
+  final String message;
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      body: OceanBackground(
+        child: SafeArea(
+          child: Center(
+            child: Padding(
+              padding: const EdgeInsets.all(24),
+              child: GlassCard(
+                child: Column(
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    const Icon(Icons.lock_reset, color: aquamarine, size: 58),
+                    const SizedBox(height: 16),
+                    const Text(
+                      'Secure sign-in needs recovery',
+                      textAlign: TextAlign.center,
+                      style: TextStyle(color: white, fontSize: 23, fontWeight: FontWeight.bold),
+                    ),
+                    const SizedBox(height: 12),
+                    Text(
+                      '$message No dashboard will open until Supabase sign-in is valid again.',
+                      textAlign: TextAlign.center,
+                      style: TextStyle(color: white.withValues(alpha: 0.85)),
+                    ),
+                    const SizedBox(height: 22),
+                    SizedBox(
+                      width: double.infinity,
+                      child: ElevatedButton.icon(
+                        onPressed: () => _signOutAndReturnToRoleSelection(context),
+                        icon: const Icon(Icons.logout),
+                        label: const Text('SIGN OUT AND REAUTHENTICATE'),
+                        style: ElevatedButton.styleFrom(
+                          backgroundColor: aquamarine,
+                          foregroundColor: deepNavy,
+                          padding: const EdgeInsets.symmetric(vertical: 15),
+                        ),
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+}
+
 class DashboardScreen extends StatelessWidget {
   final UserRole role;
 
   const DashboardScreen({super.key, required this.role});
 
   Future<void> _signOut(BuildContext context) async {
-    await Supabase.instance.client.auth.signOut();
-    if (!context.mounted) return;
-    Navigator.pushAndRemoveUntil(
-      context,
-      MaterialPageRoute(builder: (_) => const RoleSelectionScreen()),
-          (route) => false,
-    );
+    await _confirmSignOutAndReturn(context);
   }
 
   @override
@@ -631,7 +1236,7 @@ class DashboardScreen extends StatelessWidget {
         foregroundColor: white,
         actions: [
           IconButton(
-            tooltip: 'Sign out',
+            tooltip: 'Sign out and unlink this device',
             onPressed: () => _signOut(context),
             icon: const Icon(Icons.logout),
           ),

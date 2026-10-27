@@ -441,10 +441,14 @@ class _StudentBleScreenState extends State<StudentBleScreen> {
 
   Future<void> _stopScanning() async {
     try { await FlutterBluePlus.stopScan(); } catch (_) {}
-    if (mounted) setState(() {
-      _isScanning = false;
-      _status = _detectedTeachers.isEmpty ? 'Scanning stopped. No teacher found.' : 'Teacher detected.';
-    });
+    if (mounted) {
+      setState(() {
+        _isScanning = false;
+        _status = _detectedTeachers.isEmpty
+            ? 'Scanning stopped. No teacher found.'
+            : 'Teacher detected.';
+      });
+    }
   }
 
   Future<void> _markPresent() async {
