@@ -7,6 +7,7 @@ import 'package:flutter_secure_storage/flutter_secure_storage.dart';
 
 import 'app_theme.dart';
 import 'attendance_screen.dart';
+import 'device_proof.dart';
 
 import 'package:supabase_flutter/supabase_flutter.dart';
 
@@ -809,6 +810,59 @@ class _DeviceAuthSetupScreenState extends State<DeviceAuthSetupScreen> {
   String _status =
       'Link this account to this phone before opening the dashboard.';
 
+  /// Students bind a hardware-backed Keystore key to their account. The first
+  /// phone is activated; any other phone waits for administrator approval, so
+  /// an email/password login alone can never move attendance to a new device.
+  Future<void> _registerStudentDevice() async {
+    final binding = DeviceAccountBinding(
+      userId: widget.userId,
+      role: widget.role,
+    );
+    await _verifyBoundSupabaseSession(binding)
+        .timeout(const Duration(seconds: 20));
+
+    final proof = DeviceProof(Supabase.instance.client);
+    var registration = await DeviceProof.storedRegistration(widget.userId);
+    String? serverStatus;
+    if (registration != null && await DeviceKey.publicKey() != null) {
+      serverStatus = await proof.serverStatus(registration);
+    }
+    if (serverStatus != 'active' && serverStatus != 'pending') {
+      if (mounted) {
+        setState(
+          () => _status =
+              'Confirm with your fingerprint or face to register this phone.',
+        );
+      }
+      registration = await proof.register(
+        reason: registration == null ? 'new_device' : 're_registration',
+      );
+      serverStatus = registration.status == DeviceRegistrationStatus.active
+          ? 'active'
+          : 'pending';
+    }
+    if (serverStatus == 'pending') {
+      if (mounted) {
+        setState(
+          () => _status =
+              'Another phone is already registered to this account. '
+              'This phone is waiting for administrator approval; tap the '
+              'button again after it is approved.',
+        );
+      }
+      return;
+    }
+
+    await DeviceAccountBindingStore.save(binding);
+    if (!mounted) return;
+    Navigator.of(context).pushAndRemoveUntil(
+      MaterialPageRoute<void>(
+        builder: (_) => DashboardScreen(role: widget.role),
+      ),
+      (route) => false,
+    );
+  }
+
   Future<void> _enableDeviceUnlock() async {
     if (_isLoading) return;
     setState(() {
@@ -817,6 +871,10 @@ class _DeviceAuthSetupScreenState extends State<DeviceAuthSetupScreen> {
     });
 
     try {
+      if (widget.role == UserRole.student) {
+        await _registerStudentDevice();
+        return;
+      }
       final localAuth = LocalAuthentication();
       if (!await localAuth.isDeviceSupported()) {
         setState(() {
@@ -852,6 +910,8 @@ class _DeviceAuthSetupScreenState extends State<DeviceAuthSetupScreen> {
         ),
         (route) => false,
       );
+    } on DeviceProofException catch (error) {
+      if (mounted) setState(() => _status = error.message);
     } on DeviceSessionValidationException catch (error) {
       if (mounted) {
         setState(
@@ -920,7 +980,9 @@ class _DeviceAuthSetupScreenState extends State<DeviceAuthSetupScreen> {
                     ),
                     const SizedBox(height: 14),
                     Text(
-                      'Use the face, fingerprint, or PIN, pattern, or password configured in your phone security prompt.',
+                      widget.role == UserRole.student
+                          ? 'Student attendance requires a fingerprint or face unlock. Only one phone per student is active at a time; switching phones needs administrator approval.'
+                          : 'Use the face, fingerprint, or PIN, pattern, or password configured in your phone security prompt.',
                       textAlign: TextAlign.center,
                       style: TextStyle(color: mutedInk, fontSize: 13),
                     ),
@@ -976,7 +1038,22 @@ class DeviceUnlockScreen extends StatefulWidget {
 
 class _DeviceUnlockScreenState extends State<DeviceUnlockScreen> {
   bool _isLoading = false;
+  bool _needsRegistration = false;
   String _status = '';
+
+  Future<void> _registerAgain() async {
+    await DeviceAccountBindingStore.clear();
+    if (!mounted) return;
+    Navigator.of(context).pushAndRemoveUntil(
+      MaterialPageRoute<void>(
+        builder: (_) => DeviceAuthSetupScreen(
+          userId: widget.binding.userId,
+          role: widget.binding.role,
+        ),
+      ),
+      (route) => false,
+    );
+  }
 
   Future<void> _unlock() async {
     if (_isLoading) return;
@@ -986,22 +1063,29 @@ class _DeviceUnlockScreenState extends State<DeviceUnlockScreen> {
     });
 
     try {
-      final localAuth = LocalAuthentication();
-      final authenticated = await localAuth.authenticate(
-        localizedReason: 'Unlock Oceanic Attendance with this phone.',
-        biometricOnly: false,
-        persistAcrossBackgrounding: true,
-      );
-      if (!authenticated) {
-        setState(
-          () => _status =
-              'Authentication failed or was cancelled. You can retry.',
+      if (widget.binding.role == UserRole.student) {
+        await _verifyBoundSupabaseSession(widget.binding)
+            .timeout(const Duration(seconds: 20));
+        // The server verifies a fresh signature from this phone's registered
+        // key; no local "authenticated" flag is trusted.
+        await DeviceProof(Supabase.instance.client).unlock();
+      } else {
+        final localAuth = LocalAuthentication();
+        final authenticated = await localAuth.authenticate(
+          localizedReason: 'Unlock Oceanic Attendance with this phone.',
+          biometricOnly: false,
+          persistAcrossBackgrounding: true,
         );
-        return;
+        if (!authenticated) {
+          setState(
+            () => _status =
+                'Authentication failed or was cancelled. You can retry.',
+          );
+          return;
+        }
+        await _verifyBoundSupabaseSession(widget.binding)
+            .timeout(const Duration(seconds: 20));
       }
-
-      await _verifyBoundSupabaseSession(widget.binding)
-          .timeout(const Duration(seconds: 20));
       if (!mounted) return;
       Navigator.of(context).pushAndRemoveUntil(
         MaterialPageRoute<void>(
@@ -1009,6 +1093,12 @@ class _DeviceUnlockScreenState extends State<DeviceUnlockScreen> {
         ),
         (route) => false,
       );
+    } on DeviceProofException catch (error) {
+      if (!mounted) return;
+      setState(() {
+        _status = error.message;
+        _needsRegistration = error.requiresReRegistration;
+      });
     } on DeviceSessionValidationException catch (error) {
       if (!mounted) return;
       setState(() {
@@ -1106,6 +1196,14 @@ class _DeviceUnlockScreenState extends State<DeviceUnlockScreen> {
                         ),
                       ),
                     ),
+                    if (_needsRegistration) ...[
+                      const SizedBox(height: 10),
+                      TextButton.icon(
+                        onPressed: _isLoading ? null : _registerAgain,
+                        icon: const Icon(Icons.phonelink_setup),
+                        label: const Text('REGISTER THIS PHONE AGAIN'),
+                      ),
+                    ],
                   ],
                 ),
               ),

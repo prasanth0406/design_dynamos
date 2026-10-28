@@ -4,6 +4,7 @@
 import 'dart:async';
 import 'dart:convert';
 import 'dart:math';
+import 'dart:typed_data';
 
 import 'package:flutter/material.dart';
 import 'package:flutter_ble_peripheral/flutter_ble_peripheral.dart';
@@ -20,6 +21,16 @@ const String bleServiceUuid = 'bf27730d-860a-4e09-889c-2d8b6a9e0fe7';
 
 String _newSessionCode() =>
     (100000 + Random.secure().nextInt(900000)).toString();
+
+/// 6 random bytes broadcast in the BLE scan response next to the session ID.
+/// The server only stores their SHA-256 hash and rotates them with the QR.
+Uint8List _newBleToken() {
+  final random = Random.secure();
+  return Uint8List.fromList(List<int>.generate(6, (_) => random.nextInt(256)));
+}
+
+String _hex(List<int> bytes) =>
+    bytes.map((b) => b.toRadixString(16).padLeft(2, '0')).join();
 
 String _attendanceStartError(Object error) {
   final detail = error.toString();
@@ -192,9 +203,11 @@ class _TeacherBleScreenState extends State<TeacherBleScreen> {
       }
 
       final initialQr = _newSessionCode();
+      final initialBle = _newBleToken();
       final activeSession = await _backend.createSession(
         title: name.trim(),
         initialQrCode: initialQr,
+        initialBleToken: _hex(initialBle),
       );
       session = activeSession;
       _sessionId = activeSession.sessionCode;
@@ -207,6 +220,7 @@ class _TeacherBleScreenState extends State<TeacherBleScreen> {
         await _backend.rotateQr(
           sessionId: activeSession.id,
           qrCode: displayedQr,
+          bleToken: _hex(initialBle),
         );
       }
 
@@ -225,17 +239,7 @@ class _TeacherBleScreenState extends State<TeacherBleScreen> {
       await _subscribeAndWait(channel);
       final records = await _backend.loadPresentStudents(activeSession.id);
 
-      // Android scan-response service data carries the stable ID. Students
-      // resolve it through Supabase to display this session's actual title.
-      final result = await _peripheral.start(
-        advertiseData: const AdvertiseDataCore(serviceUuid: bleServiceUuid),
-        androidSettings: AndroidAdvertiseSettings(
-          advertiseResponseData: AndroidAdvertiseData(
-            serviceDataUuid: bleServiceUuid,
-            serviceData: utf8.encode(activeSession.sessionCode),
-          ),
-        ),
-      );
+      final result = await _advertise(activeSession.sessionCode, initialBle);
       if (result != PeripheralBluetoothState.granted &&
           result != PeripheralBluetoothState.ready) {
         throw Exception(
@@ -287,6 +291,25 @@ class _TeacherBleScreenState extends State<TeacherBleScreen> {
     }
   }
 
+  /// Scan-response service data = 6 ASCII session-ID digits + 6 rotating
+  /// BLE-token bytes (2 + 16 + 12 = 30 of the 31 available bytes). Students
+  /// resolve the ID through Supabase and must present the current token.
+  Future<PeripheralBluetoothState> _advertise(
+    String sessionCode,
+    List<int> bleToken,
+  ) => _peripheral.start(
+    advertiseData: const AdvertiseDataCore(serviceUuid: bleServiceUuid),
+    androidSettings: AndroidAdvertiseSettings(
+      advertiseResponseData: AndroidAdvertiseData(
+        serviceDataUuid: bleServiceUuid,
+        serviceData: Uint8List.fromList([
+          ...utf8.encode(sessionCode),
+          ...bleToken,
+        ]),
+      ),
+    ),
+  );
+
   void _startQrTimers(DateTime endsAt) {
     _qrRotationTimer?.cancel();
     _sessionEndTimer?.cancel();
@@ -313,8 +336,21 @@ class _TeacherBleScreenState extends State<TeacherBleScreen> {
     if (sessionId == null || !_isAdvertising || _isRotatingQr) return;
     _isRotatingQr = true;
     final nextQr = _generateQrCode();
+    final nextBle = _newBleToken();
     try {
-      await _backend.rotateQr(sessionId: sessionId, qrCode: nextQr);
+      await _backend.rotateQr(
+        sessionId: sessionId,
+        qrCode: nextQr,
+        bleToken: _hex(nextBle),
+      );
+      if (_isAdvertising) {
+        await _peripheral.stop();
+        final state = await _advertise(_sessionId, nextBle);
+        if (state != PeripheralBluetoothState.granted &&
+            state != PeripheralBluetoothState.ready) {
+          throw Exception('BLE advertising could not restart ($state).');
+        }
+      }
       if (mounted && _isAdvertising) {
         setState(() {
           _qrCode = nextQr;
@@ -491,7 +527,7 @@ class _TeacherBleScreenState extends State<TeacherBleScreen> {
                       ),
                       const SizedBox(height: 4),
                       const Text(
-                        'Each QR is valid for 10 seconds. The session ID stays the same for this session.',
+                        'Each QR code and BLE token is valid for 10 seconds. Students without a camera can type the rotating code.',
                         style: TextStyle(color: mutedInk, fontSize: 12),
                       ),
                       const SizedBox(height: 20),
@@ -623,6 +659,7 @@ class _StudentBleScreenState extends State<StudentBleScreen> {
   final _backend = AttendanceBackend(Supabase.instance.client);
   final Map<String, _DiscoveredSession> _sessions = {};
   final Set<String> _lookedUp = {};
+  final Map<String, ({String token, DateTime seenAt})> _bleTokens = {};
   final TextEditingController _idController = TextEditingController();
   StreamSubscription<List<ScanResult>>? _scanSubscription;
   StreamSubscription<bool>? _scanStateSubscription;
@@ -699,12 +736,16 @@ class _StudentBleScreenState extends State<StudentBleScreen> {
       if (!hasService) continue;
       String? id;
       for (final item in result.advertisementData.serviceData.entries) {
-        if (item.key.toString().toLowerCase() == bleServiceUuid) {
-          final candidate = utf8
-              .decode(item.value, allowMalformed: true)
-              .trim();
-          if (RegExp(r'^\d{6}$').hasMatch(candidate)) id = candidate;
-        }
+        if (item.key.toString().toLowerCase() != bleServiceUuid) continue;
+        final value = item.value;
+        if (value.length != 12) continue;
+        final candidate = String.fromCharCodes(value.sublist(0, 6));
+        if (!RegExp(r'^\d{6}$').hasMatch(candidate)) continue;
+        id = candidate;
+        _bleTokens[candidate] = (
+          token: _hex(value.sublist(6)),
+          seenAt: DateTime.now(),
+        );
       }
       if (id == null) continue;
       final existing = _sessions[id];
@@ -768,8 +809,34 @@ class _StudentBleScreenState extends State<StudentBleScreen> {
   bool get _canSubmit {
     if (_loading || _selected == null || _result?.ok == true) return false;
     if (_method == 'qr') return _qrCode != null;
-    return _method == 'session_id' &&
+    return _method == 'code' &&
         RegExp(r'^\d{6}$').hasMatch(_idController.text.trim());
+  }
+
+  /// Returns the rotating BLE token most recently heard from [sessionCode],
+  /// re-scanning briefly if the last one is older than 3 seconds.
+  Future<String?> _freshBleToken(String sessionCode) async {
+    bool fresh(DateTime since) {
+      final seen = _bleTokens[sessionCode];
+      return seen != null && seen.seenAt.isAfter(since);
+    }
+
+    final cutoff = DateTime.now().subtract(const Duration(seconds: 3));
+    if (fresh(cutoff)) return _bleTokens[sessionCode]!.token;
+    final started = DateTime.now();
+    try {
+      await FlutterBluePlus.startScan(
+        withServices: [Guid(bleServiceUuid)],
+        timeout: const Duration(seconds: 8),
+      );
+      while (!fresh(started) &&
+          DateTime.now().difference(started) < const Duration(seconds: 8)) {
+        await Future<void>.delayed(const Duration(milliseconds: 200));
+      }
+    } finally {
+      await _stopScan();
+    }
+    return fresh(started) ? _bleTokens[sessionCode]!.token : null;
   }
 
   Future<void> _markAttendance() async {
@@ -781,20 +848,39 @@ class _StudentBleScreenState extends State<StudentBleScreen> {
       );
       return;
     }
-    final method = _method!;
+    final qrCode = _method == 'qr' ? _qrCode! : _idController.text.trim();
     setState(() {
       _loading = true;
       _result = null;
-      _status = 'Validating attendance with Supabase...';
+      _status = 'Listening for the teacher’s current BLE signal...';
     });
     try {
+      final bleToken = await _freshBleToken(selected.session.sessionCode);
+      if (bleToken == null) {
+        if (mounted) {
+          setState(() {
+            _result = const AttendanceResult(
+              ok: false,
+              code: 'invalid_ble',
+              message: 'No current BLE signal from the teacher’s phone. Move closer, keep Bluetooth on and retry.',
+            );
+            _status = _result!.message;
+          });
+        }
+        return;
+      }
+      if (mounted) {
+        setState(
+          () => _status =
+              'Confirm with your fingerprint or face to sign '
+              'this attendance request...',
+        );
+      }
       final result = await _backend.markPresent(
         sessionId: selected.session.id,
-        sessionCode: method == 'session_id'
-            ? _idController.text.trim()
-            : selected.session.sessionCode,
-        method: method,
-        qrCode: method == 'qr' ? _qrCode : null,
+        sessionCode: selected.session.sessionCode,
+        qrCode: qrCode,
+        bleToken: bleToken,
       );
       if (mounted) {
         setState(() {
@@ -980,12 +1066,12 @@ class _StudentBleScreenState extends State<StudentBleScreen> {
                             onPressed: _loading
                                 ? null
                                 : () => setState(() {
-                                    _method = 'session_id';
+                                    _method = 'code';
                                     _scannerOpen = false;
                                     _qrCode = null;
                                   }),
                             icon: const Icon(Icons.pin),
-                            label: const Text('Enter Session ID'),
+                            label: const Text('Enter Code'),
                           ),
                         ),
                       ],
@@ -1018,7 +1104,7 @@ class _StudentBleScreenState extends State<StudentBleScreen> {
                           ),
                         ),
                     ],
-                    if (_method == 'session_id')
+                    if (_method == 'code')
                       TextField(
                         controller: _idController,
                         onChanged: (_) => setState(() {}),
@@ -1026,8 +1112,8 @@ class _StudentBleScreenState extends State<StudentBleScreen> {
                         maxLength: 6,
                         style: const TextStyle(color: ink),
                         decoration: const InputDecoration(
-                          labelText: '6-digit session ID',
-                          hintText: 'Enter the ID shown by the teacher',
+                          labelText: '6-digit rotating code',
+                          hintText: 'Type the code shown under the QR',
                           counterText: '',
                           prefixIcon: Icon(Icons.pin),
                         ),

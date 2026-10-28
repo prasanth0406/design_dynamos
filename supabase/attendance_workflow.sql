@@ -1,5 +1,5 @@
 -- Attendance workflow upgrade for the existing Supabase Auth project.
--- Run this in the Supabase SQL Editor before testing the updated Flutter app.
+-- Run this in the Supabase SQL Editor, then run supabase/device_security.sql.
 
 create schema if not exists extensions;
 create extension if not exists pgcrypto with schema extensions;
@@ -41,7 +41,7 @@ $$;
 
 drop trigger if exists assign_role_from_college_email on auth.users;
 create trigger assign_role_from_college_email
-before insert or update of email on auth.users
+before insert or update of email, raw_user_meta_data on auth.users
 for each row execute function public.assign_role_from_college_email();
 
 create or replace function public.sync_profile_from_auth_user()
@@ -113,7 +113,12 @@ alter table public.attendance_sessions
   add column if not exists session_code text,
   add column if not exists is_active boolean not null default false,
   add column if not exists current_qr_hash text,
-  add column if not exists current_qr_expires_at timestamptz;
+  add column if not exists current_qr_expires_at timestamptz,
+  add column if not exists current_ble_hash text,
+  add column if not exists current_ble_expires_at timestamptz,
+  add column if not exists previous_qr_hash text,
+  add column if not exists previous_ble_hash text,
+  add column if not exists previous_codes_expire_at timestamptz;
 
 create unique index if not exists attendance_sessions_session_code_key
   on public.attendance_sessions (session_code);
@@ -169,15 +174,22 @@ using (
   )
 );
 
-revoke insert, update, delete on public.attendance_sessions from anon, authenticated;
-revoke insert, update, delete on public.attendance_records from anon, authenticated;
+revoke all on public.profiles from anon, authenticated;
+revoke all on public.attendance_sessions from anon, authenticated;
+revoke all on public.attendance_records from anon, authenticated;
 grant select on public.profiles to authenticated;
 grant select on public.attendance_sessions to authenticated;
 grant select on public.attendance_records to authenticated;
 
+-- Teacher-generated rotating codes. The QR code (six digits) is shown on the
+-- teacher's screen; the BLE token (12 hex chars = 6 random bytes) is broadcast
+-- only in the teacher's BLE advertisement. Both rotate every 10 seconds and the
+-- previous pair stays valid for a short grace period to absorb scan latency.
+drop function if exists public.create_attendance_session(text, text);
 create or replace function public.create_attendance_session(
   p_title text,
-  p_initial_qr_code text
+  p_initial_qr_code text,
+  p_initial_ble_token text
 )
 returns jsonb
 language plpgsql
@@ -199,6 +211,9 @@ begin
   if p_initial_qr_code is null or p_initial_qr_code !~ '^[0-9]{6}$' then
     raise exception 'The initial QR code must contain six digits.';
   end if;
+  if p_initial_ble_token is null or p_initial_ble_token !~ '^[0-9a-f]{12}$' then
+    raise exception 'The initial BLE token must contain 12 lowercase hex characters.';
+  end if;
 
   for attempt in 1..25 loop
     generated_code := (100000 + floor(random() * 900000)::integer)::text;
@@ -210,7 +225,12 @@ begin
       ends_at,
       is_active,
       current_qr_hash,
-      current_qr_expires_at
+      current_qr_expires_at,
+      current_ble_hash,
+      current_ble_expires_at,
+      previous_qr_hash,
+      previous_ble_hash,
+      previous_codes_expire_at
     ) values (
       (select auth.uid()),
       trim(p_title),
@@ -219,7 +239,12 @@ begin
       now() + interval '1 minute',
       true,
       encode(extensions.digest(p_initial_qr_code, 'sha256'), 'hex'),
-      now() + interval '10 seconds'
+      now() + interval '10 seconds',
+      encode(extensions.digest(p_initial_ble_token, 'sha256'), 'hex'),
+      now() + interval '10 seconds',
+      null,
+      null,
+      null
     )
     on conflict (session_code) do nothing
     returning * into created_session;
@@ -276,9 +301,11 @@ begin
 end;
 $$;
 
+drop function if exists public.rotate_attendance_qr(uuid, text);
 create or replace function public.rotate_attendance_qr(
   p_session_id uuid,
-  p_qr_code text
+  p_qr_code text,
+  p_ble_token text
 )
 returns jsonb
 language plpgsql
@@ -287,6 +314,7 @@ set search_path = ''
 as $$
 declare
   session_end timestamptz;
+  new_expiry timestamptz;
 begin
   if (select auth.uid()) is null
      or public.current_app_role() is distinct from 'teacher' then
@@ -294,6 +322,9 @@ begin
   end if;
   if p_qr_code is null or p_qr_code !~ '^[0-9]{6}$' then
     raise exception 'A QR code must contain six digits.';
+  end if;
+  if p_ble_token is null or p_ble_token !~ '^[0-9a-f]{12}$' then
+    raise exception 'A BLE token must contain 12 lowercase hex characters.';
   end if;
 
   select s.ends_at into session_end
@@ -307,15 +338,19 @@ begin
     raise exception 'This attendance session is no longer active.';
   end if;
 
+  new_expiry := least(now() + interval '10 seconds', session_end);
+
   update public.attendance_sessions
-  set current_qr_hash = encode(extensions.digest(p_qr_code, 'sha256'), 'hex'),
-      current_qr_expires_at = least(now() + interval '10 seconds', session_end)
+  set previous_qr_hash = current_qr_hash,
+      previous_ble_hash = current_ble_hash,
+      previous_codes_expire_at = least(now() + interval '4 seconds', session_end),
+      current_qr_hash = encode(extensions.digest(p_qr_code, 'sha256'), 'hex'),
+      current_qr_expires_at = new_expiry,
+      current_ble_hash = encode(extensions.digest(p_ble_token, 'sha256'), 'hex'),
+      current_ble_expires_at = new_expiry
   where id = p_session_id;
 
-  return jsonb_build_object(
-    'ok', true,
-    'expires_at', least(now() + interval '10 seconds', session_end)
-  );
+  return jsonb_build_object('ok', true, 'expires_at', new_expiry);
 end;
 $$;
 
@@ -336,7 +371,12 @@ begin
   update public.attendance_sessions
   set is_active = false,
       current_qr_hash = null,
-      current_qr_expires_at = null
+      current_qr_expires_at = null,
+      current_ble_hash = null,
+      current_ble_expires_at = null,
+      previous_qr_hash = null,
+      previous_ble_hash = null,
+      previous_codes_expire_at = null
   where id = p_session_id
     and teacher_id = (select auth.uid());
   stopped := found;
@@ -345,152 +385,22 @@ begin
 end;
 $$;
 
-create or replace function public.mark_attendance(
-  p_session_id uuid,
-  p_session_code text,
-  p_method text,
-  p_qr_code text default null
-)
-returns jsonb
-language plpgsql
-security definer
-set search_path = ''
-as $$
-declare
-  active_session public.attendance_sessions%rowtype;
-  student_email text;
-  inserted_record uuid;
-begin
-  if (select auth.uid()) is null
-     or public.current_app_role() is distinct from 'student' then
-    return jsonb_build_object(
-      'ok', false,
-      'code', 'student_only',
-      'message', 'Sign in with a student account to mark attendance.'
-    );
-  end if;
-
-  if p_method is null or p_method not in ('qr', 'session_id') then
-    return jsonb_build_object(
-      'ok', false,
-      'code', 'invalid_method',
-      'message', 'Choose QR scanning or session ID entry.'
-    );
-  end if;
-
-  select s.* into active_session
-  from public.attendance_sessions as s
-  where s.id = p_session_id
-  for update;
-
-  if not found
-     or p_session_code is null
-     or active_session.session_code <> p_session_code then
-    return jsonb_build_object(
-      'ok', false,
-      'code', 'invalid_session_id',
-      'message', 'The session ID does not match the selected BLE session.'
-    );
-  end if;
-
-  if not active_session.is_active
-     or active_session.starts_at > now()
-     or active_session.ends_at <= now() then
-    return jsonb_build_object(
-      'ok', false,
-      'code', 'session_ended',
-      'message', 'This attendance session has ended.'
-    );
-  end if;
-
-  if p_method = 'session_id' then
-    if p_session_code !~ '^[0-9]{6}$' then
-      return jsonb_build_object(
-        'ok', false,
-        'code', 'invalid_session_id',
-        'message', 'Enter the six-digit ID for the selected session.'
-      );
-    end if;
-  else
-    if p_qr_code is null or p_qr_code !~ '^[0-9]{6}$' then
-      return jsonb_build_object(
-        'ok', false,
-        'code', 'invalid_qr',
-        'message', 'Scan the current six-digit QR code and try again.'
-      );
-    end if;
-    if active_session.current_qr_expires_at is null
-       or active_session.current_qr_expires_at <= now()
-       or active_session.current_qr_hash is null
-       or active_session.current_qr_hash <>
-          encode(extensions.digest(p_qr_code, 'sha256'), 'hex') then
-      return jsonb_build_object(
-        'ok', false,
-        'code', 'invalid_qr',
-        'message', 'The QR code is incorrect or has expired. Scan the current code.'
-      );
-    end if;
-  end if;
-
-  select p.email into student_email
-  from public.profiles as p
-  where p.user_id = (select auth.uid())
-    and p.role = 'student';
-
-  if student_email is null then
-    return jsonb_build_object(
-      'ok', false,
-      'code', 'student_profile_missing',
-      'message', 'The student profile could not be verified.'
-    );
-  end if;
-
-  insert into public.attendance_records (
-    session_id,
-    student_id,
-    student_email,
-    marked_at
-  ) values (
-    active_session.id,
-    (select auth.uid()),
-    student_email,
-    now()
-  )
-  on conflict (session_id, student_id) do nothing
-  returning id into inserted_record;
-
-  if inserted_record is null then
-    return jsonb_build_object(
-      'ok', false,
-      'code', 'already_marked',
-      'message', 'Attendance is already marked for this session.'
-    );
-  end if;
-
-  return jsonb_build_object(
-    'ok', true,
-    'code', 'present',
-    'message', 'Attendance marked successfully.',
-    'session_name', active_session.title,
-    'student_email', student_email,
-    'status', 'Present',
-    'marked_at', now()
-  );
-end;
-$$;
+-- The old client-callable mark_attendance RPC let any signed-in student mark
+-- attendance directly through PostgREST, bypassing BLE, biometrics and device
+-- binding. Attendance is now recorded only by the device-attendance Edge
+-- Function after server-side signature verification (see device_security.sql).
+drop function if exists public.mark_attendance(uuid, text, text, text);
 
 revoke all on function public.current_app_role() from public, anon;
-revoke all on function public.create_attendance_session(text, text) from public, anon;
+revoke all on function public.create_attendance_session(text, text, text) from public, anon;
 revoke all on function public.lookup_active_attendance_session(text) from public, anon;
-revoke all on function public.rotate_attendance_qr(uuid, text) from public, anon;
+revoke all on function public.rotate_attendance_qr(uuid, text, text) from public, anon;
 revoke all on function public.stop_attendance_session(uuid) from public, anon;
-revoke all on function public.mark_attendance(uuid, text, text, text) from public, anon;
 grant execute on function public.current_app_role() to authenticated;
-grant execute on function public.create_attendance_session(text, text) to authenticated;
+grant execute on function public.create_attendance_session(text, text, text) to authenticated;
 grant execute on function public.lookup_active_attendance_session(text) to authenticated;
-grant execute on function public.rotate_attendance_qr(uuid, text) to authenticated;
+grant execute on function public.rotate_attendance_qr(uuid, text, text) to authenticated;
 grant execute on function public.stop_attendance_session(uuid) to authenticated;
-grant execute on function public.mark_attendance(uuid, text, text, text) to authenticated;
 
 do $$
 begin
