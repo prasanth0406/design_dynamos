@@ -47,3 +47,8 @@ kotlin {
 flutter {
     source = "../.."
 }
+
+dependencies {
+    // BiometricPrompt + CryptoObject for per-use Keystore signing (DeviceKeyPlugin.kt).
+    implementation("androidx.biometric:biometric:1.1.0")
+}

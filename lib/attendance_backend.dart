@@ -1,5 +1,7 @@
 import 'package:supabase_flutter/supabase_flutter.dart';
 
+import 'device_proof.dart';
+
 class ActiveAttendanceSession {
   const ActiveAttendanceSession({
     required this.id,
@@ -91,10 +93,15 @@ class AttendanceBackend {
   Future<ActiveAttendanceSession> createSession({
     required String title,
     required String initialQrCode,
+    required String initialBleToken,
   }) async {
     final response = await _client.rpc(
       'create_attendance_session',
-      params: {'p_title': title, 'p_initial_qr_code': initialQrCode},
+      params: {
+        'p_title': title,
+        'p_initial_qr_code': initialQrCode,
+        'p_initial_ble_token': initialBleToken,
+      },
     );
     return ActiveAttendanceSession.fromJson(_mapFromResponse(response));
   }
@@ -111,10 +118,15 @@ class AttendanceBackend {
   Future<void> rotateQr({
     required String sessionId,
     required String qrCode,
+    required String bleToken,
   }) async {
     await _client.rpc(
       'rotate_attendance_qr',
-      params: {'p_session_id': sessionId, 'p_qr_code': qrCode},
+      params: {
+        'p_session_id': sessionId,
+        'p_qr_code': qrCode,
+        'p_ble_token': bleToken,
+      },
     );
   }
 
@@ -125,22 +137,23 @@ class AttendanceBackend {
     );
   }
 
+  /// Marks attendance through the `device-attendance` Edge Function. The
+  /// server checks the session, rotating QR code and rotating BLE token,
+  /// then requires a fresh signature from this student's registered
+  /// Keystore key (strong biometric per signature) before recording it.
   Future<AttendanceResult> markPresent({
     required String sessionId,
     required String sessionCode,
-    required String method,
-    String? qrCode,
+    required String qrCode,
+    required String bleToken,
   }) async {
-    final response = await _client.rpc(
-      'mark_attendance',
-      params: {
-        'p_session_id': sessionId,
-        'p_session_code': sessionCode,
-        'p_method': method,
-        'p_qr_code': qrCode,
-      },
+    final response = await DeviceProof(_client).markAttendance(
+      sessionId: sessionId,
+      sessionCode: sessionCode,
+      qrCode: qrCode,
+      bleToken: bleToken,
     );
-    return AttendanceResult.fromJson(_mapFromResponse(response));
+    return AttendanceResult.fromJson(response);
   }
 
   Future<List<AttendanceRecord>> loadPresentStudents(String sessionId) async {
