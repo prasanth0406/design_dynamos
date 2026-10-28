@@ -7,6 +7,9 @@ import 'package:flutter_secure_storage/flutter_secure_storage.dart';
 
 import 'app_theme.dart';
 import 'attendance_screen.dart';
+import 'attendance_backend.dart';
+import 'device_crypto.dart';
+import 'attendance_summary.dart';
 
 import 'package:supabase_flutter/supabase_flutter.dart';
 
@@ -20,8 +23,6 @@ const String _legacySupabaseSessionKey = 'sb-otfazpvwsxintyzcytvx-auth-token';
 final FlutterSecureStorage _secureStorage = FlutterSecureStorage();
 
 /// Stores Supabase's refresh/access tokens encrypted on this device.
-/// Existing SharedPreferences sessions are migrated once to avoid forcing users
-/// to sign in again after upgrading this app.
 class SecureSupabaseLocalStorage extends LocalStorage {
   SecureSupabaseLocalStorage()
     : _legacyStorage = SharedPreferencesLocalStorage(
@@ -95,12 +96,21 @@ UserRole? _userRoleFromValue(Object? value) {
 }
 
 class DeviceAccountBinding {
-  const DeviceAccountBinding({required this.userId, required this.role});
+  const DeviceAccountBinding({
+    required this.userId,
+    required this.role,
+    required this.deviceId,
+  });
 
   final String userId;
   final UserRole role;
+  final String deviceId;
 
-  String encode() => jsonEncode({'userId': userId, 'role': role.value});
+  String encode() => jsonEncode({
+    'userId': userId,
+    'role': role.value,
+    'deviceId': deviceId,
+  });
 
   static DeviceAccountBinding decode(String raw) {
     final decoded = jsonDecode(raw);
@@ -109,10 +119,15 @@ class DeviceAccountBinding {
     }
     final userId = decoded['userId'];
     final role = _userRoleFromValue(decoded['role']);
+    final deviceId = decoded['deviceId']?.toString() ?? '';
     if (userId is! String || userId.isEmpty || role == null) {
       throw const FormatException('Invalid device account binding.');
     }
-    return DeviceAccountBinding(userId: userId, role: role);
+    return DeviceAccountBinding(
+      userId: userId,
+      role: role,
+      deviceId: deviceId,
+    );
   }
 }
 
@@ -147,8 +162,6 @@ Future<User> _verifyBoundSupabaseSession(DeviceAccountBinding binding) async {
     );
   }
 
-  // Refresh on every unlock so a revoked refresh token is rejected before the
-  // app opens, even if the locally cached access JWT has not expired yet.
   final session = (await auth.refreshSession()).session;
   if (session == null || session.user.id != binding.userId) {
     throw const DeviceSessionValidationException(
@@ -195,6 +208,9 @@ class _SecureStartupRouterState extends State<SecureStartupRouter> {
         return const SessionRecoveryScreen(
           message: 'The saved Supabase account does not match this device binding. Secure account recovery is required before access can be restored.',
         );
+      }
+      if (binding.role == UserRole.student && binding.deviceId.isEmpty) {
+        return DeviceAuthSetupScreen(userId: session.user.id, role: binding.role);
       }
       return DeviceUnlockScreen(binding: binding);
     }
@@ -246,10 +262,6 @@ class MyApp extends StatelessWidget {
   }
 }
 
-// Email format rules:
-// Student: 23bcs123@iiitdwd.ac.in, 24bcs123@iiitdwd.ac.in,
-//          or 25bcs123@iiitdwd.ac.in (three digits assumed).
-// Teacher: a username beginning with a letter, e.g. name@iiitdwd.ac.in.
 bool isValidStudentEmail(String email) {
   final pattern = RegExp(
     r'^(23bcs|24bcs|25bcs)\d{3}@iiitdwd\.ac\.in$',
@@ -506,11 +518,7 @@ class _RoleAuthScreenState extends State<RoleAuthScreen> {
       final response = await Supabase.instance.client.auth.signUp(
         email: email,
         password: password,
-        data: {
-          // This records the selected role as signup metadata.
-          // For production security, enforce roles on the server/database too.
-          'role': widget.role.value,
-        },
+        data: {'role': widget.role.value},
       );
 
       if (!mounted) return;
@@ -568,7 +576,6 @@ class _RoleAuthScreenState extends State<RoleAuthScreen> {
         return;
       }
 
-      // Check the role saved when the account was created.
       final storedRole = user.userMetadata?['role']?.toString().toLowerCase();
 
       if (storedRole != widget.role.value) {
@@ -670,26 +677,6 @@ class _RoleAuthScreenState extends State<RoleAuthScreen> {
                         },
                       ),
                     ),
-                    if (!isSignUp) ...[
-                      const SizedBox(height: 12),
-                      Row(
-                        crossAxisAlignment: CrossAxisAlignment.start,
-                        children: [
-                          const Icon(
-                            Icons.security,
-                            color: brandOrange,
-                            size: 18,
-                          ),
-                          const SizedBox(width: 8),
-                          Expanded(
-                            child: Text(
-                              'After your first sign-in, this phone will ask you to enable face, fingerprint, or screen-lock authentication.',
-                              style: TextStyle(color: mutedInk, fontSize: 12),
-                            ),
-                          ),
-                        ],
-                      ),
-                    ],
                     const SizedBox(height: 26),
                     SizedBox(
                       width: double.infinity,
@@ -807,44 +794,90 @@ class DeviceAuthSetupScreen extends StatefulWidget {
 class _DeviceAuthSetupScreenState extends State<DeviceAuthSetupScreen> {
   bool _isLoading = false;
   String _status =
-      'Link this account to this phone before opening the dashboard.';
+      'Bind this device to your student attendance account with hardware keys.';
+  bool _showRecoveryOption = false;
 
   Future<void> _enableDeviceUnlock() async {
     if (_isLoading) return;
     setState(() {
       _isLoading = true;
-      _status = 'Confirm your face, fingerprint, or phone screen lock.';
+      _showRecoveryOption = false;
+      _status = 'Configuring Android Keystore cryptographic keys...';
     });
 
     try {
-      final localAuth = LocalAuthentication();
-      if (!await localAuth.isDeviceSupported()) {
-        setState(() {
-          _status = 'Set up face unlock, a fingerprint, or a PIN, pattern, or password in phone settings, then retry.';
-        });
-        return;
-      }
+      final deviceId = await DeviceCrypto.getOrCreateDeviceId();
 
-      final authenticated = await localAuth.authenticate(
-        localizedReason: 'Enable secure sign-in for Oceanic Attendance.',
-        biometricOnly: false,
-        persistAcrossBackgrounding: true,
-      );
-      if (!authenticated) {
-        setState(
-          () =>
-              _status = 'Setup was cancelled. Retry to enable secure sign-in.',
+      if (widget.role == UserRole.student) {
+        final canAuth = await DeviceCrypto.canAuthenticate();
+        if (!canAuth) {
+          setState(() {
+            _status =
+                'Set up fingerprint or face unlock in phone security settings, then retry setup.';
+          });
+          return;
+        }
+
+        setState(() {
+          _status = 'Generating hardware-protected EC P-256 key pair...';
+        });
+
+        // 1. Generate key in Android Keystore with biometric authorization
+        final publicKeySpki = await DeviceCrypto.generateKeyPair();
+
+        setState(() {
+          _status = 'Registering device with Supabase server...';
+        });
+
+        // 2. Register public key with Supabase Edge Function
+        final backend = AttendanceBackend(Supabase.instance.client);
+        final regResult = await backend.registerDevice(
+          deviceId: deviceId,
+          publicKeySpki: publicKeySpki,
+          deviceName: 'Android Student Phone',
         );
-        return;
+
+        if (regResult['ok'] != true) {
+          if (regResult['code'] == 'device_already_registered') {
+            setState(() {
+              _showRecoveryOption = true;
+              _status =
+                  'An active attendance device is already registered for your account. You cannot link a new phone without an approved device recovery request.';
+            });
+            return;
+          }
+          setState(() {
+            _status = 'Device registration rejected: ${regResult['message']}';
+          });
+          return;
+        }
+      } else {
+        // Teacher setup uses local auth
+        final localAuth = LocalAuthentication();
+        if (!await localAuth.isDeviceSupported()) {
+          setState(() {
+            _status = 'Set up screen lock or biometrics in settings, then retry.';
+          });
+          return;
+        }
+        final authenticated = await localAuth.authenticate(
+          localizedReason: 'Enable teacher access on this phone.',
+          biometricOnly: false,
+        );
+        if (!authenticated) {
+          setState(() => _status = 'Setup was cancelled. Retry to continue.');
+          return;
+        }
       }
 
       final binding = DeviceAccountBinding(
         userId: widget.userId,
         role: widget.role,
+        deviceId: deviceId,
       );
-      await _verifyBoundSupabaseSession(binding)
-          .timeout(const Duration(seconds: 20));
+      await _verifyBoundSupabaseSession(binding).timeout(const Duration(seconds: 20));
       await DeviceAccountBindingStore.save(binding);
+
       if (!mounted) return;
       Navigator.of(context).pushAndRemoveUntil(
         MaterialPageRoute<void>(
@@ -852,37 +885,30 @@ class _DeviceAuthSetupScreenState extends State<DeviceAuthSetupScreen> {
         ),
         (route) => false,
       );
+    } on DeviceCryptoException catch (error) {
+      if (mounted) {
+        setState(() => _status = 'Hardware security error: ${error.message}');
+      }
     } on DeviceSessionValidationException catch (error) {
       if (mounted) {
-        setState(
-          () => _status =
-              '${error.message} Secure account recovery is required before the dashboard can open.',
-        );
-      }
-    } on AuthRetryableFetchException catch (error) {
-      debugPrint('Supabase setup could not reach the server: ${error.message}');
-      if (mounted) {
-        setState(
-          () => _status = 'Supabase could not be reached. Check your connection and retry setup.',
-        );
-      }
-    } on AuthException catch (error) {
-      debugPrint('Supabase setup validation failed: ${error.message}');
-      if (mounted) {
-        setState(
-          () => _status = 'Supabase could not validate this account. Check your connection and retry setup.',
-        );
+        setState(() => _status = '${error.message} Secure recovery required.');
       }
     } catch (error) {
-      debugPrint('Device unlock setup failed: $error');
+      debugPrint('Device setup failed: $error');
       if (mounted) {
-        setState(
-          () => _status = 'Secure setup could not finish. Check your connection and device lock settings, then retry.',
-        );
+        setState(() => _status = 'Setup error: $error. Check connection and retry.');
       }
     } finally {
       if (mounted) setState(() => _isLoading = false);
     }
+  }
+
+  void _openRecovery() {
+    Navigator.of(context).push(
+      MaterialPageRoute(
+        builder: (_) => DeviceRecoveryScreen(userId: widget.userId),
+      ),
+    );
   }
 
   @override
@@ -904,7 +930,7 @@ class _DeviceAuthSetupScreenState extends State<DeviceAuthSetupScreen> {
                     ),
                     const SizedBox(height: 16),
                     const Text(
-                      'Enable secure sign-in',
+                      'Register This Device',
                       textAlign: TextAlign.center,
                       style: TextStyle(
                         color: ink,
@@ -914,17 +940,13 @@ class _DeviceAuthSetupScreenState extends State<DeviceAuthSetupScreen> {
                     ),
                     const SizedBox(height: 10),
                     Text(
-                      'This ${widget.role.label.toLowerCase()} account will be linked to this phone. Future openings will show only the device-unlock screen.',
+                      widget.role == UserRole.student
+                          ? 'This phone will generate a hardware cryptographic key in Android Keystore bound to your biometric credentials. Only one registered phone is permitted per student.'
+                          : 'Link this teacher account securely to this phone.',
                       textAlign: TextAlign.center,
                       style: TextStyle(color: mutedInk),
                     ),
                     const SizedBox(height: 14),
-                    Text(
-                      'Use the face, fingerprint, or PIN, pattern, or password configured in your phone security prompt.',
-                      textAlign: TextAlign.center,
-                      style: TextStyle(color: mutedInk, fontSize: 13),
-                    ),
-                    const SizedBox(height: 12),
                     Text(
                       _status,
                       textAlign: TextAlign.center,
@@ -941,11 +963,14 @@ class _DeviceAuthSetupScreenState extends State<DeviceAuthSetupScreen> {
                                 height: 18,
                                 child: CircularProgressIndicator(
                                   strokeWidth: 2,
+                                  color: Colors.white,
                                 ),
                               )
-                            : const Icon(Icons.lock_open),
+                            : const Icon(Icons.security),
                         label: Text(
-                          _isLoading ? 'SETTING UP...' : 'ENABLE DEVICE UNLOCK',
+                          _isLoading
+                              ? 'SECURING DEVICE...'
+                              : 'REGISTER ATTENDANCE KEY',
                         ),
                         style: ElevatedButton.styleFrom(
                           backgroundColor: brandOrange,
@@ -954,6 +979,14 @@ class _DeviceAuthSetupScreenState extends State<DeviceAuthSetupScreen> {
                         ),
                       ),
                     ),
+                    if (_showRecoveryOption) ...[
+                      const SizedBox(height: 12),
+                      OutlinedButton.icon(
+                        onPressed: _openRecovery,
+                        icon: const Icon(Icons.phonelink_erase),
+                        label: const Text('REQUEST DEVICE REPLACEMENT'),
+                      ),
+                    ],
                   ],
                 ),
               ),
@@ -977,31 +1010,80 @@ class DeviceUnlockScreen extends StatefulWidget {
 class _DeviceUnlockScreenState extends State<DeviceUnlockScreen> {
   bool _isLoading = false;
   String _status = '';
+  bool _keyInvalidated = false;
+  bool _notRegistered = false;
 
   Future<void> _unlock() async {
     if (_isLoading) return;
     setState(() {
       _isLoading = true;
-      _status = 'Waiting for device authentication...';
+      _keyInvalidated = false;
+      _notRegistered = false;
+      _status = 'Requesting cryptographic challenge from server...';
     });
 
     try {
-      final localAuth = LocalAuthentication();
-      final authenticated = await localAuth.authenticate(
-        localizedReason: 'Unlock Oceanic Attendance with this phone.',
-        biometricOnly: false,
-        persistAcrossBackgrounding: true,
-      );
-      if (!authenticated) {
-        setState(
-          () => _status =
-              'Authentication failed or was cancelled. You can retry.',
+      final backend = AttendanceBackend(Supabase.instance.client);
+
+      if (widget.binding.role == UserRole.student) {
+        if (widget.binding.deviceId.isEmpty) {
+          setState(() {
+            _notRegistered = true;
+            _status =
+                'This phone has not completed cryptographic key registration yet. Please register your attendance key.';
+          });
+          return;
+        }
+
+        // 1. Request fresh single-use unlock challenge from Supabase
+        final challengeResult = await backend.createChallenge(
+          deviceId: widget.binding.deviceId,
+          purpose: 'unlock',
         );
-        return;
+
+        setState(() {
+          _status = 'Touch the biometric sensor to sign the challenge...';
+        });
+
+        // 2. Authorize and sign using Android Keystore private key
+        final signature = await DeviceCrypto.signChallenge(
+          challenge: challengeResult.challenge,
+          title: 'Unlock Oceanic Attendance',
+          subtitle: 'Authorize private key to sign server challenge',
+        );
+
+        setState(() {
+          _status = 'Verifying cryptographic signature on Supabase...';
+        });
+
+        // 3. Verify signature on Supabase Edge Function
+        final verified = await backend.verifyUnlock(
+          deviceId: widget.binding.deviceId,
+          challenge: challengeResult.challenge,
+          signature: signature,
+        );
+
+        if (!verified) {
+          setState(() {
+            _status = 'Cryptographic signature verification failed on server.';
+          });
+          return;
+        }
+      } else {
+        // Teacher uses local auth
+        final localAuth = LocalAuthentication();
+        final auth = await localAuth.authenticate(
+          localizedReason: 'Unlock Oceanic Attendance on this device.',
+        );
+        if (!auth) {
+          setState(() => _status = 'Authentication was cancelled.');
+          return;
+        }
       }
 
       await _verifyBoundSupabaseSession(widget.binding)
           .timeout(const Duration(seconds: 20));
+
       if (!mounted) return;
       Navigator.of(context).pushAndRemoveUntil(
         MaterialPageRoute<void>(
@@ -1009,40 +1091,85 @@ class _DeviceUnlockScreenState extends State<DeviceUnlockScreen> {
         ),
         (route) => false,
       );
+    } on KeyInvalidatedException {
+      if (!mounted) return;
+      setState(() {
+        _keyInvalidated = true;
+        _status =
+            'CRITICAL SECURITY ALERT: Biometric enrollment on this phone has changed since key registration! For security, Android Keystore has permanently invalidated the private key. You must submit a device recovery request.';
+      });
+    } on BiometricCancelledException {
+      if (!mounted) return;
+      setState(() => _status = 'Biometric verification was cancelled.');
+    } on BiometricLockoutException {
+      if (!mounted) return;
+      setState(() => _status = 'Biometric sensor locked out. Retry in 30 seconds.');
+    } on DeviceCryptoException catch (error) {
+      if (!mounted) return;
+      setState(() => _status = 'Keystore cryptographic error: ${error.message}');
     } on DeviceSessionValidationException catch (error) {
       if (!mounted) return;
       setState(() {
-        _status =
-            '${error.message} Secure account recovery is required; the dashboard remains locked.';
+        _status = '${error.message} Session recovery required.';
       });
-    } on AuthRetryableFetchException catch (error) {
-      debugPrint(
-        'Supabase unlock could not reach the server: ${error.message}',
-      );
+    } on FunctionException catch (error) {
+      debugPrint('Device unlock function error: ${error.status} ${error.details}');
       if (!mounted) return;
-      setState(() {
-        _status = 'Supabase could not be reached to validate the session. Check your connection and retry.';
-      });
-    } on AuthException catch (error) {
-      debugPrint('Supabase unlock validation failed: ${error.message}');
-      if (!mounted) return;
-      setState(() {
-        _status = 'Supabase rejected the saved session. Secure account recovery is required; the dashboard remains locked.';
-      });
-    } on TimeoutException {
-      if (!mounted) return;
-      setState(() {
-        _status = 'Supabase could not be reached to validate the session. Check your connection and retry.';
-      });
+      final details = error.details;
+      final code = (details is Map) ? details['code']?.toString() : null;
+      final message = (details is Map)
+          ? details['message']?.toString()
+          : (error.reasonPhrase ?? 'Server error (${error.status}).');
+
+      if (code == 'device_not_registered' || error.status == 403) {
+        setState(() {
+          _notRegistered = true;
+          _status = message ??
+              'This phone is not actively registered as an attendance device. Please register your attendance key.';
+        });
+      } else {
+        setState(() {
+          _status = message ?? 'Server verification error (${error.status})';
+        });
+      }
     } catch (error) {
       debugPrint('Device unlock failed: $error');
       if (!mounted) return;
       setState(() {
-        _status = 'The saved session could not be verified. Check your connection and retry.';
+        _status = 'Unlock could not be verified: $error';
       });
     } finally {
       if (mounted) setState(() => _isLoading = false);
     }
+  }
+
+  void _openSetup() {
+    Navigator.of(context).pushReplacement(
+      MaterialPageRoute(
+        builder: (_) => DeviceAuthSetupScreen(
+          userId: widget.binding.userId,
+          role: widget.binding.role,
+        ),
+      ),
+    );
+  }
+
+  Future<void> _signOut() async {
+    await DeviceAccountBindingStore.clear();
+    await Supabase.instance.client.auth.signOut();
+    if (!mounted) return;
+    Navigator.of(context).pushAndRemoveUntil(
+      MaterialPageRoute<void>(builder: (_) => const RoleSelectionScreen()),
+      (route) => false,
+    );
+  }
+
+  void _openRecovery() {
+    Navigator.of(context).push(
+      MaterialPageRoute(
+        builder: (_) => DeviceRecoveryScreen(userId: widget.binding.userId),
+      ),
+    );
   }
 
   @override
@@ -1051,20 +1178,24 @@ class _DeviceUnlockScreenState extends State<DeviceUnlockScreen> {
       body: AppBackground(
         child: SafeArea(
           child: Center(
-            child: Padding(
+            child: SingleChildScrollView(
               padding: const EdgeInsets.all(AppSpacing.large),
               child: AppSurfaceCard(
                 child: Column(
                   mainAxisSize: MainAxisSize.min,
                   children: [
-                    const Icon(Icons.lock_person, color: brandOrange, size: 64),
+                    Icon(
+                      _keyInvalidated ? Icons.warning_rounded : Icons.lock_person,
+                      color: _keyInvalidated ? const Color(0xFFB3261E) : brandOrange,
+                      size: 64,
+                    ),
                     const SizedBox(height: 16),
-                    const Text(
-                      'Welcome back',
+                    Text(
+                      _keyInvalidated ? 'Cryptographic Key Invalidation' : 'Welcome back',
                       textAlign: TextAlign.center,
-                      style: TextStyle(
+                      style: const TextStyle(
                         color: ink,
-                        fontSize: 27,
+                        fontSize: 25,
                         fontWeight: FontWeight.bold,
                       ),
                     ),
@@ -1077,35 +1208,233 @@ class _DeviceUnlockScreenState extends State<DeviceUnlockScreen> {
                     const SizedBox(height: 16),
                     Text(
                       _status.isEmpty
-                          ? 'Unlock with your saved face, fingerprint, or phone screen lock.'
+                          ? 'Unlock with your hardware-backed cryptographic biometric key.'
                           : _status,
                       textAlign: TextAlign.center,
-                      style: const TextStyle(color: brandOrange),
-                    ),
-                    const SizedBox(height: 22),
-                    SizedBox(
-                      width: double.infinity,
-                      child: ElevatedButton.icon(
-                        onPressed: _isLoading ? null : _unlock,
-                        icon: _isLoading
-                            ? const SizedBox(
-                                width: 18,
-                                height: 18,
-                                child: CircularProgressIndicator(
-                                  strokeWidth: 2,
-                                ),
-                              )
-                            : const Icon(Icons.lock_open),
-                        label: Text(
-                          _isLoading ? 'VERIFYING...' : 'UNLOCK THIS DEVICE',
-                        ),
-                        style: ElevatedButton.styleFrom(
-                          backgroundColor: brandOrange,
-                          foregroundColor: white,
-                          padding: const EdgeInsets.symmetric(vertical: 15),
-                        ),
+                      style: TextStyle(
+                        color: _keyInvalidated ? const Color(0xFFB3261E) : brandOrange,
+                        fontWeight: _keyInvalidated ? FontWeight.bold : FontWeight.normal,
                       ),
                     ),
+                    const SizedBox(height: 22),
+                    if (!_keyInvalidated && !_notRegistered)
+                      SizedBox(
+                        width: double.infinity,
+                        child: ElevatedButton.icon(
+                          onPressed: _isLoading ? null : _unlock,
+                          icon: _isLoading
+                              ? const SizedBox(
+                                  width: 18,
+                                  height: 18,
+                                  child: CircularProgressIndicator(
+                                    strokeWidth: 2,
+                                    color: Colors.white,
+                                  ),
+                                )
+                              : const Icon(Icons.fingerprint),
+                          label: Text(
+                            _isLoading ? 'VERIFYING...' : 'SIGN & UNLOCK DEVICE',
+                          ),
+                          style: ElevatedButton.styleFrom(
+                            backgroundColor: brandOrange,
+                            foregroundColor: white,
+                            padding: const EdgeInsets.symmetric(vertical: 15),
+                          ),
+                        ),
+                      ),
+                    if (_notRegistered)
+                      SizedBox(
+                        width: double.infinity,
+                        child: ElevatedButton.icon(
+                          onPressed: _openSetup,
+                          icon: const Icon(Icons.app_registration),
+                          label: const Text('REGISTER ATTENDANCE KEY'),
+                          style: ElevatedButton.styleFrom(
+                            backgroundColor: brandOrange,
+                            foregroundColor: white,
+                            padding: const EdgeInsets.symmetric(vertical: 15),
+                          ),
+                        ),
+                      ),
+                    if (_keyInvalidated)
+                      SizedBox(
+                        width: double.infinity,
+                        child: ElevatedButton.icon(
+                          onPressed: _openRecovery,
+                          icon: const Icon(Icons.restart_alt),
+                          label: const Text('SUBMIT RECOVERY REQUEST'),
+                          style: ElevatedButton.styleFrom(
+                            backgroundColor: const Color(0xFFB3261E),
+                            foregroundColor: white,
+                            padding: const EdgeInsets.symmetric(vertical: 15),
+                          ),
+                        ),
+                      ),
+                    const SizedBox(height: 16),
+                    TextButton.icon(
+                      onPressed: _isLoading ? null : _signOut,
+                      icon: const Icon(Icons.logout, size: 18),
+                      label: const Text('Sign out of this device'),
+                      style: TextButton.styleFrom(
+                        foregroundColor: mutedInk,
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+class DeviceRecoveryScreen extends StatefulWidget {
+  const DeviceRecoveryScreen({super.key, required this.userId});
+
+  final String userId;
+
+  @override
+  State<DeviceRecoveryScreen> createState() => _DeviceRecoveryScreenState();
+}
+
+class _DeviceRecoveryScreenState extends State<DeviceRecoveryScreen> {
+  final TextEditingController _reasonController = TextEditingController();
+  bool _isLoading = false;
+  String? _status;
+  bool _submitted = false;
+
+  @override
+  void dispose() {
+    _reasonController.dispose();
+    super.dispose();
+  }
+
+  Future<void> _submitRecovery() async {
+    final reason = _reasonController.text.trim();
+    if (reason.length < 5) {
+      setState(() => _status = 'Please provide a clear reason (at least 5 characters).');
+      return;
+    }
+
+    setState(() {
+      _isLoading = true;
+      _status = 'Generating new Keystore key pair on this phone...';
+    });
+
+    try {
+      final deviceId = await DeviceCrypto.getOrCreateDeviceId();
+      final newPublicKeySpki = await DeviceCrypto.generateKeyPair();
+
+      setState(() => _status = 'Submitting request to course administration...');
+
+      final backend = AttendanceBackend(Supabase.instance.client);
+      final result = await backend.requestDeviceRecovery(
+        newDeviceId: deviceId,
+        newPublicKeySpki: newPublicKeySpki,
+        reason: reason,
+      );
+
+      if (!mounted) return;
+      setState(() {
+        _submitted = true;
+        _status = result['message']?.toString() ??
+            'Recovery request submitted. Please notify your course teacher to review and approve your device replacement.';
+      });
+    } catch (e) {
+      if (mounted) {
+        setState(() => _status = 'Failed to submit recovery request: $e');
+      }
+    } finally {
+      if (mounted) setState(() => _isLoading = false);
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      appBar: AppBar(
+        title: const Text('Device Recovery'),
+        backgroundColor: deepNavy,
+        foregroundColor: white,
+      ),
+      body: AppBackground(
+        child: SafeArea(
+          child: Center(
+            child: SingleChildScrollView(
+              padding: const EdgeInsets.all(AppSpacing.large),
+              child: AppSurfaceCard(
+                child: Column(
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    const Icon(Icons.phonelink_setup, color: brandOrange, size: 54),
+                    const SizedBox(height: 14),
+                    const Text(
+                      'Request Device Replacement',
+                      textAlign: TextAlign.center,
+                      style: TextStyle(
+                        color: ink,
+                        fontSize: 23,
+                        fontWeight: FontWeight.bold,
+                      ),
+                    ),
+                    const SizedBox(height: 8),
+                    const Text(
+                      'Because each student is permitted only one active attendance phone, registering a new phone or resetting invalidated biometric keys requires verified teacher/admin approval.',
+                      textAlign: TextAlign.center,
+                      style: TextStyle(color: mutedInk, fontSize: 13),
+                    ),
+                    const SizedBox(height: 18),
+                    if (!_submitted) ...[
+                      TextField(
+                        controller: _reasonController,
+                        maxLines: 3,
+                        style: const TextStyle(color: ink),
+                        decoration: const InputDecoration(
+                          labelText: 'Reason for Device Replacement',
+                          hintText: 'e.g., Phone was replaced, biometric template was reset, etc.',
+                        ),
+                      ),
+                      const SizedBox(height: 16),
+                      if (_status != null)
+                        Text(
+                          _status!,
+                          textAlign: TextAlign.center,
+                          style: const TextStyle(color: brandOrange),
+                        ),
+                      const SizedBox(height: 16),
+                      SizedBox(
+                        width: double.infinity,
+                        child: ElevatedButton.icon(
+                          onPressed: _isLoading ? null : _submitRecovery,
+                          icon: _isLoading
+                              ? const SizedBox(
+                                  width: 18,
+                                  height: 18,
+                                  child: CircularProgressIndicator(
+                                    strokeWidth: 2,
+                                    color: white,
+                                  ),
+                                )
+                              : const Icon(Icons.send),
+                          label: Text(_isLoading ? 'SUBMITTING...' : 'SUBMIT RECOVERY REQUEST'),
+                        ),
+                      ),
+                    ] else ...[
+                      const Icon(Icons.check_circle_outline, color: Color(0xFF287A45), size: 54),
+                      const SizedBox(height: 12),
+                      Text(
+                        _status ?? 'Request submitted.',
+                        textAlign: TextAlign.center,
+                        style: const TextStyle(color: Color(0xFF287A45), fontWeight: FontWeight.bold),
+                      ),
+                      const SizedBox(height: 18),
+                      TextButton(
+                        onPressed: () => Navigator.of(context).pop(),
+                        child: const Text('BACK TO LOGIN'),
+                      ),
+                    ],
                   ],
                 ),
               ),
@@ -1151,6 +1480,23 @@ class SessionRecoveryScreen extends StatelessWidget {
                       textAlign: TextAlign.center,
                       style: TextStyle(color: mutedInk),
                     ),
+                    const SizedBox(height: 20),
+                    OutlinedButton(
+                      onPressed: () async {
+                        await Supabase.instance.client.auth.signOut();
+                        await DeviceAccountBindingStore.clear();
+                        if (context.mounted) {
+                          Navigator.pushAndRemoveUntil(
+                            context,
+                            MaterialPageRoute(
+                              builder: (_) => const RoleSelectionScreen(),
+                            ),
+                            (r) => false,
+                          );
+                        }
+                      },
+                      child: const Text('SIGN OUT AND RESET'),
+                    ),
                   ],
                 ),
               ),
@@ -1186,7 +1532,6 @@ Future<String> getStudentDisplayName() async {
       return 'Student';
     }
 
-    // The imported directory uses SURNAME FIRSTNAME order, e.g. PALCHURI PRASANTH.
     final nameParts = fullName.split(RegExp(r'\s+'));
     final displayName = nameParts.last.toLowerCase();
     return displayName[0].toUpperCase() + displayName.substring(1);
@@ -1196,21 +1541,116 @@ Future<String> getStudentDisplayName() async {
   }
 }
 
-class DashboardScreen extends StatelessWidget {
+class DashboardScreen extends StatefulWidget {
   final UserRole role;
 
   const DashboardScreen({super.key, required this.role});
 
   @override
+  State<DashboardScreen> createState() => _DashboardScreenState();
+}
+
+class _DashboardScreenState extends State<DashboardScreen> {
+  Future<StudentAttendanceSummary>? _attendanceSummaryFuture;
+  Future<List<TeacherSession>>? _teacherSessionsFuture;
+  RealtimeChannel? _studentAttendanceChannel;
+
+  @override
+  void initState() {
+    super.initState();
+    if (widget.role == UserRole.student) {
+      _loadAttendanceSummary();
+      _setupRealtimeSubscription();
+    } else {
+      _loadTeacherSessions();
+    }
+  }
+
+  @override
+  void dispose() {
+    final ch = _studentAttendanceChannel;
+    if (ch != null) {
+      Supabase.instance.client.removeChannel(ch);
+    }
+    super.dispose();
+  }
+
+  void _setupRealtimeSubscription() {
+    final uid = Supabase.instance.client.auth.currentUser?.id;
+    if (uid == null) return;
+
+    final client = Supabase.instance.client;
+    _studentAttendanceChannel = client.channel('student-attendance-summary-$uid')
+      ..onPostgresChanges(
+        event: PostgresChangeEvent.all,
+        schema: 'public',
+        table: 'attendance_records',
+        filter: PostgresChangeFilter(
+          type: PostgresChangeFilterType.eq,
+          column: 'student_id',
+          value: uid,
+        ),
+        callback: (_) {
+          if (mounted) {
+            _loadAttendanceSummary();
+          }
+        },
+      )
+      ..subscribe();
+  }
+
+  void _loadAttendanceSummary() {
+    final backend = AttendanceBackend(Supabase.instance.client);
+    setState(() {
+      _attendanceSummaryFuture = backend.getStudentAttendanceSummary();
+    });
+  }
+
+  void _loadTeacherSessions() {
+    final backend = AttendanceBackend(Supabase.instance.client);
+    setState(() {
+      _teacherSessionsFuture = backend.loadTeacherSessions();
+    });
+  }
+
+  Future<void> _refreshSummary() async {
+    if (widget.role == UserRole.teacher) {
+      _loadTeacherSessions();
+      await _teacherSessionsFuture;
+    } else {
+      _loadAttendanceSummary();
+      await _attendanceSummaryFuture;
+    }
+  }
+
+  @override
   Widget build(BuildContext context) {
-    final isTeacher = role == UserRole.teacher;
+    final isTeacher = widget.role == UserRole.teacher;
 
     return Scaffold(
       appBar: AppBar(
-        title: Text('${role.label} Dashboard'),
+        title: Text('${widget.role.label} Dashboard'),
         backgroundColor: deepNavy,
         foregroundColor: white,
-        actions: const [],
+        actions: [
+          IconButton(
+            tooltip: 'Sign Out',
+            icon: const Icon(Icons.logout),
+            onPressed: () async {
+              await Supabase.instance.client.auth.signOut();
+              await DeviceAccountBindingStore.clear();
+              if (context.mounted) {
+                Navigator.pushAndRemoveUntil(
+                  context,
+                  MaterialPageRoute(
+                    builder: (_) => const RoleSelectionScreen(),
+                  ),
+                  (r) => false,
+                );
+              }
+            },
+          ),
+        ],
       ),
       floatingActionButtonLocation: FloatingActionButtonLocation.endFloat,
       floatingActionButton: FloatingActionButton.large(
@@ -1218,8 +1658,8 @@ class DashboardScreen extends StatelessWidget {
         backgroundColor: brandOrange,
         foregroundColor: white,
         elevation: 7,
-        onPressed: () {
-          Navigator.push(
+        onPressed: () async {
+          await Navigator.push(
             context,
             MaterialPageRoute(
               builder: (_) => isTeacher
@@ -1227,6 +1667,13 @@ class DashboardScreen extends StatelessWidget {
                   : const StudentBleScreen(),
             ),
           );
+          if (mounted) {
+            if (widget.role == UserRole.student) {
+              _loadAttendanceSummary();
+            } else {
+              _loadTeacherSessions();
+            }
+          }
         },
         child: const Icon(Icons.bluetooth_searching, size: 44),
       ),
@@ -1237,14 +1684,12 @@ class DashboardScreen extends StatelessWidget {
             child: Column(
               children: [
                 const SizedBox(height: 18),
-
-                // Greeting moved above the white card and centered.
                 FutureBuilder<String>(
-                  future: role == UserRole.student
+                  future: widget.role == UserRole.student
                       ? getStudentDisplayName()
                       : Future.value('Teacher'),
                   builder: (context, snapshot) {
-                    final displayName = snapshot.data ?? role.label;
+                    final displayName = snapshot.data ?? widget.role.label;
                     return SizedBox(
                       width: double.infinity,
                       child: Text(
@@ -1259,8 +1704,148 @@ class DashboardScreen extends StatelessWidget {
                     );
                   },
                 ),
+                const SizedBox(height: 16),
+                Expanded(
+                  child: RefreshIndicator(
+                    onRefresh: _refreshSummary,
+                    color: brandOrange,
+                    backgroundColor: Colors.white,
+                    child: SingleChildScrollView(
+                      physics: const AlwaysScrollableScrollPhysics(),
+                      child: Column(
+                        children: [
+                          if (widget.role == UserRole.teacher &&
+                              _teacherSessionsFuture != null) ...[
+                            _TeacherSessionsOverviewCard(
+                              future: _teacherSessionsFuture!,
+                              onRefresh: _loadTeacherSessions,
+                            ),
+                            const SizedBox(height: 80),
+                          ],
+                          if (widget.role == UserRole.student &&
+                              _attendanceSummaryFuture != null) ...[
+                            FutureBuilder<StudentAttendanceSummary>(
+                              future: _attendanceSummaryFuture,
+                              builder: (context, snapshot) {
+                                if (snapshot.connectionState ==
+                                    ConnectionState.waiting) {
+                                  return Container(
+                                    width: double.infinity,
+                                    constraints:
+                                        const BoxConstraints(maxWidth: 440),
+                                    margin: const EdgeInsets.symmetric(
+                                      horizontal: 4,
+                                      vertical: 12,
+                                    ),
+                                    padding: const EdgeInsets.all(36),
+                                    decoration: BoxDecoration(
+                                      color: Colors.white,
+                                      borderRadius:
+                                          BorderRadius.circular(28),
+                                      boxShadow: const [
+                                        BoxShadow(
+                                          color: Color(0x18102040),
+                                          blurRadius: 24,
+                                          offset: Offset(0, 10),
+                                        ),
+                                      ],
+                                    ),
+                                    child: const Column(
+                                      mainAxisSize: MainAxisSize.min,
+                                      children: [
+                                        CircularProgressIndicator(
+                                          color: brandOrange,
+                                        ),
+                                        SizedBox(height: 18),
+                                        Text(
+                                          'Loading your attendance summary...',
+                                          style: TextStyle(
+                                            fontSize: 14,
+                                            color: mutedInk,
+                                            fontWeight: FontWeight.w500,
+                                          ),
+                                        ),
+                                      ],
+                                    ),
+                                  );
+                                }
 
-                const SizedBox(height: 24),
+                                if (snapshot.hasError) {
+                                  return Container(
+                                    width: double.infinity,
+                                    constraints:
+                                        const BoxConstraints(maxWidth: 440),
+                                    margin: const EdgeInsets.symmetric(
+                                      horizontal: 4,
+                                      vertical: 12,
+                                    ),
+                                    padding: const EdgeInsets.all(26),
+                                    decoration: BoxDecoration(
+                                      color: Colors.white,
+                                      borderRadius:
+                                          BorderRadius.circular(28),
+                                      boxShadow: const [
+                                        BoxShadow(
+                                          color: Color(0x18102040),
+                                          blurRadius: 24,
+                                          offset: Offset(0, 10),
+                                        ),
+                                      ],
+                                    ),
+                                    child: Column(
+                                      mainAxisSize: MainAxisSize.min,
+                                      children: [
+                                        const Icon(
+                                          Icons.sync_problem_rounded,
+                                          color: Color(0xFFDC2626),
+                                          size: 42,
+                                        ),
+                                        const SizedBox(height: 12),
+                                        const Text(
+                                          'Could not load attendance summary',
+                                          style: TextStyle(
+                                            fontSize: 16,
+                                            fontWeight: FontWeight.bold,
+                                            color: ink,
+                                          ),
+                                        ),
+                                        const SizedBox(height: 6),
+                                        Text(
+                                          '${snapshot.error}',
+                                          textAlign: TextAlign.center,
+                                          style: const TextStyle(
+                                            fontSize: 13,
+                                            color: mutedInk,
+                                          ),
+                                        ),
+                                        const SizedBox(height: 16),
+                                        ElevatedButton.icon(
+                                          onPressed: _loadAttendanceSummary,
+                                          icon: const Icon(Icons.refresh),
+                                          label: const Text('RETRY'),
+                                          style: ElevatedButton.styleFrom(
+                                            backgroundColor: brandOrange,
+                                            foregroundColor: white,
+                                          ),
+                                        ),
+                                      ],
+                                    ),
+                                  );
+                                }
+
+                                final summary = snapshot.data ??
+                                    StudentAttendanceSummary.empty();
+
+                                return AttendanceSummary.fromSummary(summary);
+                              },
+                            ),
+                            const SizedBox(height: 80),
+                          ],
+                        ],
+                      ),
+                    ),
+                  ),
+                ),
               ],
             ),
           ),
@@ -1269,3 +1854,296 @@ class DashboardScreen extends StatelessWidget {
     );
   }
 }
+
+class _TeacherSessionsOverviewCard extends StatelessWidget {
+  const _TeacherSessionsOverviewCard({
+    required this.future,
+    required this.onRefresh,
+  });
+
+  final Future<List<TeacherSession>> future;
+  final VoidCallback onRefresh;
+
+  @override
+  Widget build(BuildContext context) {
+    return Container(
+      width: double.infinity,
+      constraints: const BoxConstraints(maxWidth: 440),
+      margin: const EdgeInsets.symmetric(horizontal: 4, vertical: 8),
+      padding: const EdgeInsets.all(22),
+      decoration: BoxDecoration(
+        color: Colors.white,
+        borderRadius: BorderRadius.circular(28),
+        boxShadow: const [
+          BoxShadow(
+            color: Color(0x18102040),
+            blurRadius: 24,
+            offset: Offset(0, 10),
+          ),
+        ],
+      ),
+      child: FutureBuilder<List<TeacherSession>>(
+        future: future,
+        builder: (context, snapshot) {
+          if (snapshot.connectionState == ConnectionState.waiting) {
+            return const Padding(
+              padding: EdgeInsets.all(32),
+              child: Center(
+                child: CircularProgressIndicator(color: brandOrange),
+              ),
+            );
+          }
+
+          if (snapshot.hasError) {
+            return Column(
+              children: [
+                const Icon(
+                  Icons.error_outline,
+                  color: Color(0xFFDC2626),
+                  size: 36,
+                ),
+                const SizedBox(height: 8),
+                Text(
+                  'Could not load sessions: ${snapshot.error}',
+                  textAlign: TextAlign.center,
+                  style: const TextStyle(fontSize: 13, color: mutedInk),
+                ),
+                const SizedBox(height: 12),
+                ElevatedButton(
+                  onPressed: onRefresh,
+                  child: const Text('RETRY'),
+                ),
+              ],
+            );
+          }
+
+          final sessions = snapshot.data ?? [];
+
+          return Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Row(
+                mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                children: [
+                  const Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      Text(
+                        'Conducted Sessions',
+                        style: TextStyle(
+                          fontSize: 19,
+                          fontWeight: FontWeight.bold,
+                          color: ink,
+                        ),
+                      ),
+                      SizedBox(height: 3),
+                      Text(
+                        'Tap a session to mark attendance',
+                        style: TextStyle(
+                          fontSize: 13,
+                          color: mutedInk,
+                        ),
+                      ),
+                    ],
+                  ),
+                  Container(
+                    padding:
+                        const EdgeInsets.symmetric(horizontal: 10, vertical: 4),
+                    decoration: BoxDecoration(
+                      color: const Color(0xFFF1F5F9),
+                      borderRadius: BorderRadius.circular(14),
+                    ),
+                    child: Text(
+                      '${sessions.length} Total',
+                      style: const TextStyle(
+                        fontSize: 12,
+                        fontWeight: FontWeight.bold,
+                        color: Color(0xFF475569),
+                      ),
+                    ),
+                  ),
+                ],
+              ),
+              const SizedBox(height: 18),
+              if (sessions.isEmpty)
+                Container(
+                  padding: const EdgeInsets.all(28),
+                  alignment: Alignment.center,
+                  child: const Column(
+                    children: [
+                      Icon(Icons.event_note, size: 48, color: mutedInk),
+                      SizedBox(height: 10),
+                      Text(
+                        'No attendance sessions yet.\nTap the orange Bluetooth button below to create your first session.',
+                        textAlign: TextAlign.center,
+                        style: TextStyle(color: mutedInk, fontSize: 13),
+                      ),
+                    ],
+                  ),
+                )
+              else
+                ListView.separated(
+                  shrinkWrap: true,
+                  physics: const NeverScrollableScrollPhysics(),
+                  itemCount: sessions.length,
+                  separatorBuilder: (_, index) => const SizedBox(height: 10),
+                  itemBuilder: (context, idx) {
+                    final session = sessions[idx];
+                    return _TeacherSessionCard(
+                      session: session,
+                      onReturn: onRefresh,
+                    );
+                  },
+                ),
+            ],
+          );
+        },
+      ),
+    );
+  }
+}
+
+class _TeacherSessionCard extends StatelessWidget {
+  const _TeacherSessionCard({
+    required this.session,
+    required this.onReturn,
+  });
+
+  final TeacherSession session;
+  final VoidCallback onReturn;
+
+  @override
+  Widget build(BuildContext context) {
+    final dateStr =
+        '${session.startsAt.day}/${session.startsAt.month}/${session.startsAt.year} · ${TimeOfDay.fromDateTime(session.startsAt).format(context)}';
+
+    return InkWell(
+      onTap: () async {
+        await Navigator.push(
+          context,
+          MaterialPageRoute(
+            builder: (_) => TeacherSessionRosterScreen(
+              sessionId: session.id,
+              sessionTitle: session.title,
+              sessionCode: session.sessionCode,
+              startedAt: session.startsAt,
+            ),
+          ),
+        );
+        onReturn();
+      },
+      borderRadius: BorderRadius.circular(16),
+      child: Container(
+        padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 14),
+        decoration: BoxDecoration(
+          color: const Color(0xFFF8FAFC),
+          borderRadius: BorderRadius.circular(16),
+          border: Border.all(color: const Color(0xFFE2E8F0)),
+        ),
+        child: Row(
+          children: [
+            Container(
+              width: 44,
+              height: 44,
+              decoration: BoxDecoration(
+                color: session.isActive
+                    ? const Color(0xFFEFFBF5)
+                    : const Color(0xFFEEF2F6),
+                borderRadius: BorderRadius.circular(12),
+              ),
+              child: Icon(
+                session.isActive
+                    ? Icons.bluetooth_connected
+                    : Icons.check_circle_outline,
+                color: session.isActive
+                    ? const Color(0xFF16A34A)
+                    : brandOrange,
+                size: 24,
+              ),
+            ),
+            const SizedBox(width: 14),
+            Expanded(
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Text(
+                    session.title,
+                    style: const TextStyle(
+                      fontSize: 15,
+                      fontWeight: FontWeight.bold,
+                      color: ink,
+                    ),
+                  ),
+                  const SizedBox(height: 2),
+                  Text(
+                    dateStr,
+                    style: const TextStyle(
+                      fontSize: 12,
+                      color: mutedInk,
+                    ),
+                  ),
+                  const SizedBox(height: 6),
+                  Row(
+                    children: [
+                      Container(
+                        padding: const EdgeInsets.symmetric(
+                            horizontal: 8, vertical: 2),
+                        decoration: BoxDecoration(
+                          color: const Color(0xFFEFFBF5),
+                          borderRadius: BorderRadius.circular(8),
+                        ),
+                        child: Text(
+                          '${session.presentCount} Present',
+                          style: const TextStyle(
+                            fontSize: 11,
+                            fontWeight: FontWeight.bold,
+                            color: Color(0xFF16A34A),
+                          ),
+                        ),
+                      ),
+                      const SizedBox(width: 6),
+                      Container(
+                        padding: const EdgeInsets.symmetric(
+                            horizontal: 8, vertical: 2),
+                        decoration: BoxDecoration(
+                          color: const Color(0xFFFFF1F2),
+                          borderRadius: BorderRadius.circular(8),
+                        ),
+                        child: Text(
+                          '${session.absentCount} Absent',
+                          style: const TextStyle(
+                            fontSize: 11,
+                            fontWeight: FontWeight.bold,
+                            color: Color(0xFFDC2626),
+                          ),
+                        ),
+                      ),
+                      if (session.sessionCode.isNotEmpty) ...[
+                        const Spacer(),
+                        Text(
+                          '#${session.sessionCode}',
+                          style: const TextStyle(
+                            fontSize: 12,
+                            fontWeight: FontWeight.bold,
+                            color: mutedInk,
+                          ),
+                        ),
+                      ],
+                    ],
+                  ),
+                ],
+              ),
+            ),
+            const SizedBox(width: 8),
+            const Icon(
+              Icons.chevron_right,
+              color: Color(0xFF94A3B8),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+}
+
+

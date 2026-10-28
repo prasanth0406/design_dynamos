@@ -15,6 +15,7 @@ import 'package:mobile_scanner/mobile_scanner.dart';
 
 import 'app_theme.dart';
 import 'attendance_backend.dart';
+import 'device_crypto.dart';
 
 const String bleServiceUuid = 'bf27730d-860a-4e09-889c-2d8b6a9e0fe7';
 
@@ -138,6 +139,9 @@ class _TeacherBleScreenState extends State<TeacherBleScreen> {
   String _sessionId = '';
   String _qrCode = '';
   String? _activeSessionUuid;
+  String? _lastSessionId;
+  String? _lastSessionTitle;
+  String? _lastSessionCode;
   int _qrNumber = 0;
 
   String _generateQrCode() {
@@ -253,6 +257,9 @@ class _TeacherBleScreenState extends State<TeacherBleScreen> {
 
       _attendanceChannel = channel;
       _activeSessionUuid = activeSession.id;
+      _lastSessionId = activeSession.id;
+      _lastSessionTitle = activeSession.title;
+      _lastSessionCode = activeSession.sessionCode;
       setState(() {
         _sessionName = activeSession.title;
         _sessionId = activeSession.sessionCode;
@@ -545,6 +552,30 @@ class _TeacherBleScreenState extends State<TeacherBleScreen> {
                   padding: const EdgeInsets.symmetric(vertical: 16),
                 ),
               ),
+              if (!_isAdvertising && _lastSessionId != null) ...[
+                const SizedBox(height: 12),
+                OutlinedButton.icon(
+                  onPressed: () {
+                    Navigator.push(
+                      context,
+                      MaterialPageRoute(
+                        builder: (_) => TeacherSessionRosterScreen(
+                          sessionId: _lastSessionId!,
+                          sessionTitle: _lastSessionTitle ?? 'Session Roster',
+                          sessionCode: _lastSessionCode,
+                        ),
+                      ),
+                    );
+                  },
+                  icon: const Icon(Icons.assignment_ind),
+                  label: const Text('OPEN ATTENDANCE ROSTER'),
+                  style: OutlinedButton.styleFrom(
+                    foregroundColor: Colors.white,
+                    side: const BorderSide(color: Colors.white70),
+                    padding: const EdgeInsets.symmetric(vertical: 14),
+                  ),
+                ),
+              ],
               const SizedBox(height: 22),
               Text(
                 'Students present (' + _presentStudents.length.toString() + ')',
@@ -782,20 +813,53 @@ class _StudentBleScreenState extends State<StudentBleScreen> {
       return;
     }
     final method = _method!;
+    final qrValue = method == 'qr' ? _qrCode! : _idController.text.trim();
+
     setState(() {
       _loading = true;
       _result = null;
-      _status = 'Validating attendance with Supabase...';
+      _status = 'Requesting cryptographic attendance challenge...';
     });
+
     try {
-      final result = await _backend.markPresent(
+      final deviceId = await DeviceCrypto.getOrCreateDeviceId();
+
+      // 1. Request attendance challenge bound to student, device, session, and rotating QR
+      final challengeResult = await _backend.createChallenge(
+        deviceId: deviceId,
+        purpose: 'attendance',
         sessionId: selected.session.id,
-        sessionCode: method == 'session_id'
-            ? _idController.text.trim()
-            : selected.session.sessionCode,
-        method: method,
-        qrCode: method == 'qr' ? _qrCode : null,
+        sessionCode: selected.session.sessionCode,
+        qrCode: qrValue,
       );
+
+      if (!mounted) return;
+      setState(() {
+        _status = 'Confirm biometric to authorize attendance signing...';
+      });
+
+      // 2. Authorize and sign using Keystore private key with BiometricPrompt
+      final signature = await DeviceCrypto.signChallenge(
+        challenge: challengeResult.challenge,
+        title: 'Authorize Attendance Submission',
+        subtitle: 'Sign attendance challenge for ${selected.session.title}',
+      );
+
+      if (!mounted) return;
+      setState(() {
+        _status = 'Verifying cryptographic signature & recording attendance...';
+      });
+
+      // 3. Submit signed proof to Supabase Edge Function
+      final result = await _backend.verifyAndMarkAttendance(
+        deviceId: deviceId,
+        challenge: challengeResult.challenge,
+        signature: signature,
+        sessionId: selected.session.id,
+        sessionCode: selected.session.sessionCode,
+        qrCode: qrValue,
+      );
+
       if (mounted) {
         setState(() {
           _result = result;
@@ -804,16 +868,59 @@ class _StudentBleScreenState extends State<StudentBleScreen> {
               : result.message;
         });
       }
+    } on KeyInvalidatedException {
+      if (mounted) {
+        setState(() {
+          _result = const AttendanceResult(
+            ok: false,
+            code: 'key_invalidated',
+            message:
+                'Biometric enrollment on this device has changed. Cryptographic attendance key is invalidated. Device recovery is required.',
+          );
+          _status = _result!.message;
+        });
+      }
+    } on BiometricCancelledException {
+      if (mounted) {
+        setState(() {
+          _result = const AttendanceResult(
+            ok: false,
+            code: 'biometric_cancelled',
+            message: 'Biometric authorization was cancelled.',
+          );
+          _status = _result!.message;
+        });
+      }
+    } on BiometricLockoutException {
+      if (mounted) {
+        setState(() {
+          _result = const AttendanceResult(
+            ok: false,
+            code: 'biometric_lockout',
+            message:
+                'Biometric sensor locked out due to multiple failed attempts.',
+          );
+          _status = _result!.message;
+        });
+      }
+    } on DeviceCryptoException catch (e) {
+      if (mounted) {
+        setState(() {
+          _result = AttendanceResult(
+            ok: false,
+            code: 'crypto_error',
+            message: 'Hardware cryptographic error: ${e.message}',
+          );
+          _status = _result!.message;
+        });
+      }
     } catch (error) {
       if (mounted) {
         setState(() {
           _result = AttendanceResult(
             ok: false,
-            code: 'network_error',
-            message:
-                'Unable to submit attendance. Please try again. (' +
-                error.toString() +
-                ')',
+            code: 'submission_error',
+            message: 'Unable to submit attendance: $error',
           );
           _status = _result!.message;
         });
@@ -1098,7 +1205,7 @@ class _StudentBleScreenState extends State<StudentBleScreen> {
                   ],
                   const SizedBox(height: 16),
                   const Text(
-                    'BLE discovery identifies the nearby session; only Supabase verification of the QR or session ID records attendance.',
+                    'Multi-factor physical & cryptographic security: BLE verifies physical proximity, the 10-second rotating QR verifies real-time presence, and your hardware-backed Android Keystore key cryptographically signs the server attendance challenge.',
                     textAlign: TextAlign.center,
                     style: TextStyle(color: mutedInk, fontSize: 12),
                   ),
@@ -1112,4 +1219,544 @@ class _StudentBleScreenState extends State<StudentBleScreen> {
   }
 }
 
-/// current Supabase-authenticated email and the teacher's displayed session code.
+// ----------------------------------------------------------------------------
+// Teacher Session Attendance Roster Screen
+// ----------------------------------------------------------------------------
+
+class TeacherSessionRosterScreen extends StatefulWidget {
+  const TeacherSessionRosterScreen({
+    super.key,
+    required this.sessionId,
+    required this.sessionTitle,
+    this.sessionCode,
+    this.startedAt,
+  });
+
+  final String sessionId;
+  final String sessionTitle;
+  final String? sessionCode;
+  final DateTime? startedAt;
+
+  @override
+  State<TeacherSessionRosterScreen> createState() =>
+      _TeacherSessionRosterScreenState();
+}
+
+class _TeacherSessionRosterScreenState
+    extends State<TeacherSessionRosterScreen> {
+  final AttendanceBackend _backend =
+      AttendanceBackend(Supabase.instance.client);
+  final TextEditingController _searchController = TextEditingController();
+
+  List<SessionStudentRosterItem> _roster = [];
+  bool _isLoading = true;
+  String? _errorMessage;
+  String _searchQuery = '';
+  final Set<String> _markingStudentIds = {};
+
+  @override
+  void initState() {
+    super.initState();
+    _loadRoster();
+  }
+
+  @override
+  void dispose() {
+    _searchController.dispose();
+    super.dispose();
+  }
+
+  Future<void> _loadRoster() async {
+    setState(() {
+      _isLoading = true;
+      _errorMessage = null;
+    });
+
+    try {
+      final roster = await _backend.loadSessionRoster(widget.sessionId);
+      if (mounted) {
+        setState(() {
+          _roster = roster;
+          _isLoading = false;
+        });
+      }
+    } catch (e) {
+      if (mounted) {
+        setState(() {
+          _errorMessage = e.toString();
+          _isLoading = false;
+        });
+      }
+    }
+  }
+
+  Future<void> _markAttendance(
+    SessionStudentRosterItem student,
+    String targetStatus,
+  ) async {
+    if (_markingStudentIds.contains(student.studentId)) return;
+
+    final previousStatus = student.status;
+    final updatedItem = student.copyWith(
+      status: targetStatus,
+      markedAt: DateTime.now(),
+    );
+
+    setState(() {
+      _markingStudentIds.add(student.studentId);
+      final idx = _roster.indexWhere((s) => s.studentId == student.studentId);
+      if (idx != -1) {
+        _roster[idx] = updatedItem;
+      }
+    });
+
+    try {
+      await _backend.teacherMarkAttendance(
+        sessionId: widget.sessionId,
+        studentId: student.studentId,
+        status: targetStatus,
+      );
+    } catch (e) {
+      if (mounted) {
+        setState(() {
+          final idx =
+              _roster.indexWhere((s) => s.studentId == student.studentId);
+          if (idx != -1) {
+            _roster[idx] = student.copyWith(status: previousStatus);
+          }
+        });
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            content: Text('Failed to update attendance: $e'),
+            backgroundColor: const Color(0xFFDC2626),
+          ),
+        );
+      }
+    } finally {
+      if (mounted) {
+        setState(() {
+          _markingStudentIds.remove(student.studentId);
+        });
+      }
+    }
+  }
+
+  Future<void> _markAllUnmarkedAsAbsent() async {
+    final unmarked = _roster.where((s) => s.status == 'unmarked').toList();
+    if (unmarked.isEmpty) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('No unmarked students to update.')),
+      );
+      return;
+    }
+
+    final confirmed = await showDialog<bool>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: const Text('Mark Unmarked as Absent?'),
+        content: Text(
+          'This will mark ${unmarked.length} unmarked student(s) as Absent for this session.',
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(ctx, false),
+            child: const Text('CANCEL'),
+          ),
+          FilledButton(
+            onPressed: () => Navigator.pop(ctx, true),
+            style: FilledButton.styleFrom(
+              backgroundColor: const Color(0xFFDC2626),
+            ),
+            child: const Text('MARK ABSENT'),
+          ),
+        ],
+      ),
+    );
+
+    if (confirmed != true || !mounted) return;
+
+    for (final s in unmarked) {
+      unawaited(_markAttendance(s, 'absent'));
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final presentCount = _roster.where((s) => s.status == 'present').length;
+    final absentCount = _roster.where((s) => s.status == 'absent').length;
+    final unmarkedCount = _roster.where((s) => s.status == 'unmarked').length;
+
+    final filteredRoster = _roster.where((s) {
+      if (_searchQuery.isEmpty) return true;
+      final q = _searchQuery.toLowerCase();
+      return s.fullName.toLowerCase().contains(q) ||
+          s.email.toLowerCase().contains(q) ||
+          s.registerNumber.toLowerCase().contains(q);
+    }).toList();
+
+    return Scaffold(
+      backgroundColor: midnightBlue,
+      appBar: AppBar(
+        title: Text(widget.sessionTitle),
+        backgroundColor: deepNavy,
+        foregroundColor: Colors.white,
+        actions: [
+          IconButton(
+            tooltip: 'Reload Roster',
+            icon: const Icon(Icons.refresh),
+            onPressed: _loadRoster,
+          ),
+        ],
+      ),
+      body: AppBackground(
+        child: SafeArea(
+          child: Column(
+            children: [
+              // Session Info Card
+              Padding(
+                padding: const EdgeInsets.fromLTRB(16, 12, 16, 8),
+                child: AppSurfaceCard(
+                  padding: const EdgeInsets.all(16),
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      Row(
+                        mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                        children: [
+                          Expanded(
+                            child: Column(
+                              crossAxisAlignment: CrossAxisAlignment.start,
+                              children: [
+                                Text(
+                                  widget.sessionTitle,
+                                  style: const TextStyle(
+                                    fontSize: 18,
+                                    fontWeight: FontWeight.bold,
+                                    color: ink,
+                                  ),
+                                ),
+                                if (widget.sessionCode != null) ...[
+                                  const SizedBox(height: 2),
+                                  Text(
+                                    'Session Code: ${widget.sessionCode}',
+                                    style: const TextStyle(
+                                      fontSize: 13,
+                                      color: brandOrange,
+                                      fontWeight: FontWeight.w600,
+                                    ),
+                                  ),
+                                ],
+                              ],
+                            ),
+                          ),
+                          TextButton.icon(
+                            onPressed: _markAllUnmarkedAsAbsent,
+                            icon: const Icon(Icons.done_all, size: 16),
+                            label: const Text(
+                              'All Absent',
+                              style: TextStyle(fontSize: 12),
+                            ),
+                            style: TextButton.styleFrom(
+                              foregroundColor: const Color(0xFFDC2626),
+                            ),
+                          ),
+                        ],
+                      ),
+                      const SizedBox(height: 12),
+                      // Stats badges
+                      Row(
+                        children: [
+                          _RosterBadge(
+                            label: 'Present',
+                            count: presentCount,
+                            color: const Color(0xFF16A34A),
+                            bgColor: const Color(0xFFEFFBF5),
+                          ),
+                          const SizedBox(width: 8),
+                          _RosterBadge(
+                            label: 'Absent',
+                            count: absentCount,
+                            color: const Color(0xFFDC2626),
+                            bgColor: const Color(0xFFFFF1F2),
+                          ),
+                          const SizedBox(width: 8),
+                          _RosterBadge(
+                            label: 'Unmarked',
+                            count: unmarkedCount,
+                            color: const Color(0xFF64748B),
+                            bgColor: const Color(0xFFF1F5F9),
+                          ),
+                        ],
+                      ),
+                    ],
+                  ),
+                ),
+              ),
+
+              // Search bar
+              Padding(
+                padding:
+                    const EdgeInsets.symmetric(horizontal: 16, vertical: 4),
+                child: TextField(
+                  controller: _searchController,
+                  onChanged: (val) =>
+                      setState(() => _searchQuery = val.trim()),
+                  style: const TextStyle(color: Colors.white),
+                  decoration: InputDecoration(
+                    hintText:
+                        'Search student by name, register no, or email...',
+                    hintStyle:
+                        const TextStyle(color: Colors.white54, fontSize: 13),
+                    prefixIcon:
+                        const Icon(Icons.search, color: Colors.white70),
+                    suffixIcon: _searchQuery.isNotEmpty
+                        ? IconButton(
+                            icon:
+                                const Icon(Icons.clear, color: Colors.white70),
+                            onPressed: () {
+                              _searchController.clear();
+                              setState(() => _searchQuery = '');
+                            },
+                          )
+                        : null,
+                    filled: true,
+                    fillColor: Colors.white.withValues(alpha: 0.1),
+                    contentPadding: const EdgeInsets.symmetric(
+                      horizontal: 16,
+                      vertical: 10,
+                    ),
+                    border: OutlineInputBorder(
+                      borderRadius: BorderRadius.circular(12),
+                      borderSide: BorderSide.none,
+                    ),
+                  ),
+                ),
+              ),
+
+              // Student List
+              Expanded(
+                child: _isLoading
+                    ? const Center(
+                        child: CircularProgressIndicator(color: brandOrange),
+                      )
+                    : _errorMessage != null
+                        ? Center(
+                            child: Padding(
+                              padding: const EdgeInsets.all(24),
+                              child: Column(
+                                mainAxisSize: MainAxisSize.min,
+                                children: [
+                                  const Icon(
+                                    Icons.error_outline,
+                                    color: Colors.redAccent,
+                                    size: 40,
+                                  ),
+                                  const SizedBox(height: 8),
+                                  Text(
+                                    _errorMessage!,
+                                    textAlign: TextAlign.center,
+                                    style:
+                                        const TextStyle(color: Colors.white70),
+                                  ),
+                                  const SizedBox(height: 12),
+                                  ElevatedButton(
+                                    onPressed: _loadRoster,
+                                    child: const Text('RETRY'),
+                                  ),
+                                ],
+                              ),
+                            ),
+                          )
+                        : filteredRoster.isEmpty
+                            ? const Center(
+                                child: Text(
+                                  'No students found',
+                                  style: TextStyle(color: Colors.white54),
+                                ),
+                              )
+                            : RefreshIndicator(
+                                onRefresh: _loadRoster,
+                                child: ListView.builder(
+                                  padding: const EdgeInsets.fromLTRB(
+                                      16, 4, 16, 80),
+                                  itemCount: filteredRoster.length,
+                                  itemBuilder: (context, index) {
+                                    final student = filteredRoster[index];
+                                    final isUpdating = _markingStudentIds
+                                        .contains(student.studentId);
+                                    return _StudentRosterCard(
+                                      student: student,
+                                      isUpdating: isUpdating,
+                                      onMarkPresent: () =>
+                                          _markAttendance(student, 'present'),
+                                      onMarkAbsent: () =>
+                                          _markAttendance(student, 'absent'),
+                                    );
+                                  },
+                                ),
+                              ),
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+class _RosterBadge extends StatelessWidget {
+  const _RosterBadge({
+    required this.label,
+    required this.count,
+    required this.color,
+    required this.bgColor,
+  });
+
+  final String label;
+  final int count;
+  final Color color;
+  final Color bgColor;
+
+  @override
+  Widget build(BuildContext context) {
+    return Container(
+      padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 4),
+      decoration: BoxDecoration(
+        color: bgColor,
+        borderRadius: BorderRadius.circular(12),
+      ),
+      child: Text(
+        '$label: $count',
+        style: TextStyle(
+          color: color,
+          fontSize: 12,
+          fontWeight: FontWeight.bold,
+        ),
+      ),
+    );
+  }
+}
+
+class _StudentRosterCard extends StatelessWidget {
+  const _StudentRosterCard({
+    required this.student,
+    required this.isUpdating,
+    required this.onMarkPresent,
+    required this.onMarkAbsent,
+  });
+
+  final SessionStudentRosterItem student;
+  final bool isUpdating;
+  final VoidCallback onMarkPresent;
+  final VoidCallback onMarkAbsent;
+
+  @override
+  Widget build(BuildContext context) {
+    final isPresent = student.status == 'present';
+    final isAbsent = student.status == 'absent';
+
+    return Card(
+      color: Colors.white,
+      margin: const EdgeInsets.symmetric(vertical: 4),
+      shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(14)),
+      child: Padding(
+        padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 10),
+        child: Row(
+          children: [
+            CircleAvatar(
+              radius: 18,
+              backgroundColor: isPresent
+                  ? const Color(0xFFEFFBF5)
+                  : isAbsent
+                      ? const Color(0xFFFFF1F2)
+                      : const Color(0xFFF1F5F9),
+              child: isUpdating
+                  ? const SizedBox(
+                      width: 14,
+                      height: 14,
+                      child: CircularProgressIndicator(strokeWidth: 2),
+                    )
+                  : Icon(
+                      isPresent
+                          ? Icons.check
+                          : isAbsent
+                              ? Icons.close
+                              : Icons.person_outline,
+                      size: 18,
+                      color: isPresent
+                          ? const Color(0xFF16A34A)
+                          : isAbsent
+                              ? const Color(0xFFDC2626)
+                              : const Color(0xFF64748B),
+                    ),
+            ),
+            const SizedBox(width: 12),
+            Expanded(
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Text(
+                    student.fullName,
+                    style: const TextStyle(
+                      fontWeight: FontWeight.bold,
+                      fontSize: 14,
+                      color: ink,
+                    ),
+                  ),
+                  const SizedBox(height: 2),
+                  Text(
+                    '${student.registerNumber} · ${student.email}',
+                    style: const TextStyle(
+                      fontSize: 11,
+                      color: mutedInk,
+                    ),
+                  ),
+                ],
+              ),
+            ),
+            const SizedBox(width: 6),
+            ElevatedButton(
+              onPressed: isUpdating ? null : onMarkPresent,
+              style: ElevatedButton.styleFrom(
+                elevation: 0,
+                backgroundColor: isPresent
+                    ? const Color(0xFF16A34A)
+                    : const Color(0xFFF1F5F9),
+                foregroundColor:
+                    isPresent ? Colors.white : const Color(0xFF334155),
+                padding:
+                    const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
+                minimumSize: const Size(0, 32),
+                shape: RoundedRectangleBorder(
+                  borderRadius: BorderRadius.circular(8),
+                ),
+              ),
+              child: const Text('Present',
+                  style: TextStyle(fontSize: 12, fontWeight: FontWeight.bold)),
+            ),
+            const SizedBox(width: 4),
+            ElevatedButton(
+              onPressed: isUpdating ? null : onMarkAbsent,
+              style: ElevatedButton.styleFrom(
+                elevation: 0,
+                backgroundColor: isAbsent
+                    ? const Color(0xFFDC2626)
+                    : const Color(0xFFF1F5F9),
+                foregroundColor:
+                    isAbsent ? Colors.white : const Color(0xFF334155),
+                padding:
+                    const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
+                minimumSize: const Size(0, 32),
+                shape: RoundedRectangleBorder(
+                  borderRadius: BorderRadius.circular(8),
+                ),
+              ),
+              child: const Text('Absent',
+                  style: TextStyle(fontSize: 12, fontWeight: FontWeight.bold)),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+}
