@@ -1162,6 +1162,40 @@ class SessionRecoveryScreen extends StatelessWidget {
   }
 }
 
+Future<String> getStudentDisplayName() async {
+  final supabase = Supabase.instance.client;
+  final email = supabase.auth.currentUser?.email?.trim().toLowerCase();
+
+  if (email == null || email.isEmpty) {
+    return 'Student';
+  }
+
+  try {
+    final result = await supabase
+        .from('student_directory')
+        .select('full_name')
+        .eq('email', email)
+        .maybeSingle();
+
+    if (result == null) {
+      return 'Student';
+    }
+
+    final fullName = result['full_name']?.toString().trim() ?? '';
+    if (fullName.isEmpty) {
+      return 'Student';
+    }
+
+    // The imported directory uses SURNAME FIRSTNAME order, e.g. PALCHURI PRASANTH.
+    final nameParts = fullName.split(RegExp(r'\s+'));
+    final displayName = nameParts.last.toLowerCase();
+    return displayName[0].toUpperCase() + displayName.substring(1);
+  } catch (error) {
+    debugPrint('Student name lookup failed: $error');
+    return 'Student';
+  }
+}
+
 class DashboardScreen extends StatelessWidget {
   final UserRole role;
 
@@ -1178,66 +1212,56 @@ class DashboardScreen extends StatelessWidget {
         foregroundColor: white,
         actions: const [],
       ),
+      floatingActionButtonLocation: FloatingActionButtonLocation.endFloat,
+      floatingActionButton: FloatingActionButton.large(
+        tooltip: isTeacher ? 'Start BLE Attendance' : 'Find Teacher',
+        backgroundColor: brandOrange,
+        foregroundColor: white,
+        elevation: 7,
+        onPressed: () {
+          Navigator.push(
+            context,
+            MaterialPageRoute(
+              builder: (_) => isTeacher
+                  ? const TeacherBleScreen()
+                  : const StudentBleScreen(),
+            ),
+          );
+        },
+        child: const Icon(Icons.bluetooth_searching, size: 44),
+      ),
       body: AppBackground(
-        child: Center(
+        child: SafeArea(
           child: Padding(
             padding: const EdgeInsets.all(AppSpacing.large),
-            child: AppSurfaceCard(
-              child: Column(
-                mainAxisSize: MainAxisSize.min,
-                children: [
-                  Icon(
-                    isTeacher ? Icons.cast_for_education : Icons.school,
-                    color: brandOrange,
-                    size: 60,
-                  ),
-                  const SizedBox(height: 18),
-                  Text(
-                    'Welcome, ${role.label}!',
-                    textAlign: TextAlign.center,
-                    style: const TextStyle(
-                      color: ink,
-                      fontSize: 26,
-                      fontWeight: FontWeight.bold,
-                    ),
-                  ),
-                  const SizedBox(height: 12),
-                  Text(
-                    isTeacher
-                        ? 'Your teacher dashboard is ready. Attendance management features can be added here.'
-                        : 'Your student dashboard is ready. Attendance viewing and marking features can be added here.',
-                    textAlign: TextAlign.center,
-                    style: TextStyle(color: mutedInk, fontSize: 15),
-                  ),
-                  const SizedBox(height: 24),
-                  SizedBox(
-                    width: double.infinity,
-                    child: ElevatedButton.icon(
-                      icon: Icon(
-                        isTeacher ? Icons.bluetooth_searching : Icons.bluetooth,
+            child: Column(
+              children: [
+                const SizedBox(height: 18),
+
+                // Greeting moved above the white card and centered.
+                FutureBuilder<String>(
+                  future: role == UserRole.student
+                      ? getStudentDisplayName()
+                      : Future.value('Teacher'),
+                  builder: (context, snapshot) {
+                    final displayName = snapshot.data ?? role.label;
+                    return SizedBox(
+                      width: double.infinity,
+                      child: Text(
+                        'Hello, $displayName!',
+                        textAlign: TextAlign.center,
+                        style: const TextStyle(
+                          color: white,
+                          fontSize: 28,
+                          fontWeight: FontWeight.bold,
+                        ),
                       ),
-                      label: Text(
-                        isTeacher ? 'Start BLE Attendance' : 'Find Teacher',
-                      ),
-                      style: ElevatedButton.styleFrom(
-                        backgroundColor: brandOrange,
-                        foregroundColor: white,
-                        padding: const EdgeInsets.symmetric(vertical: 15),
-                      ),
-                      onPressed: () {
-                        Navigator.push(
-                          context,
-                          MaterialPageRoute(
-                            builder: (_) => isTeacher
-                                ? const TeacherBleScreen()
-                                : const StudentBleScreen(),
-                          ),
-                        );
-                      },
-                    ),
-                  ),
-                ],
-              ),
+                    );
+                  },
+                ),
+
+                const SizedBox(height: 24),
+              ],
             ),
           ),
         ),
