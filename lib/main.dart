@@ -4,6 +4,7 @@ import 'dart:convert';
 import 'package:flutter/material.dart';
 import 'package:local_auth/local_auth.dart';
 import 'package:flutter_secure_storage/flutter_secure_storage.dart';
+import 'package:flutter_blue_plus/flutter_blue_plus.dart';
 
 import 'app_theme.dart';
 import 'attendance_screen.dart';
@@ -1551,18 +1552,29 @@ class DashboardScreen extends StatefulWidget {
 }
 
 class _DashboardScreenState extends State<DashboardScreen> {
-  Future<StudentAttendanceSummary>? _attendanceSummaryFuture;
   Future<List<TeacherSession>>? _teacherSessionsFuture;
+  
+  // Student-specific futures for subject summaries and updates
+  Future<StudentAttendanceSummary>? _sdttSummaryFuture;
+  Future<StudentAttendanceSummary>? _deSummaryFuture;
+  Future<StudentAttendanceSummary>? _daaSummaryFuture;
+  Future<List<Map<String, dynamic>>>? _recentUpdatesFuture;
+  Future<ActiveAttendanceSession?>? _activeSessionFuture;
+  
   RealtimeChannel? _studentAttendanceChannel;
   String? _selectedSubject;
+  
+  // Bluetooth state
+  BluetoothAdapterState _bleAdapterState = BluetoothAdapterState.unknown;
+  StreamSubscription<BluetoothAdapterState>? _adapterStateSubscription;
 
   @override
   void initState() {
     super.initState();
     if (widget.role == UserRole.student) {
-      // Initially, we don't load summary until a subject is selected
-      // Or we can load overall summary. The request says "subject-specific Attendance Overview card that appears... when a student clicks"
+      _loadAllStudentData();
       _setupRealtimeSubscription();
+      _setupBluetoothListener();
     } else {
       _loadTeacherSessions();
     }
@@ -1574,7 +1586,16 @@ class _DashboardScreenState extends State<DashboardScreen> {
     if (ch != null) {
       Supabase.instance.client.removeChannel(ch);
     }
+    _adapterStateSubscription?.cancel();
     super.dispose();
+  }
+
+  void _setupBluetoothListener() {
+    _adapterStateSubscription = FlutterBluePlus.adapterState.listen((state) {
+      if (mounted) {
+        setState(() => _bleAdapterState = state);
+      }
+    });
   }
 
   void _setupRealtimeSubscription() {
@@ -1582,7 +1603,7 @@ class _DashboardScreenState extends State<DashboardScreen> {
     if (uid == null) return;
 
     final client = Supabase.instance.client;
-    _studentAttendanceChannel = client.channel('student-attendance-summary-$uid')
+    _studentAttendanceChannel = client.channel('student-dashboard-$uid')
       ..onPostgresChanges(
         event: PostgresChangeEvent.all,
         schema: 'public',
@@ -1593,18 +1614,22 @@ class _DashboardScreenState extends State<DashboardScreen> {
           value: uid,
         ),
         callback: (_) {
-          if (mounted && _selectedSubject != null) {
-            _loadAttendanceSummary(subject: _selectedSubject);
+          if (mounted) {
+            _loadAllStudentData();
           }
         },
       )
       ..subscribe();
   }
 
-  void _loadAttendanceSummary({String? subject}) {
+  void _loadAllStudentData() {
     final backend = AttendanceBackend(Supabase.instance.client);
     setState(() {
-      _attendanceSummaryFuture = backend.getStudentAttendanceSummary(subject: subject);
+      _sdttSummaryFuture = backend.getStudentAttendanceSummary(subject: 'SDTT');
+      _deSummaryFuture = backend.getStudentAttendanceSummary(subject: 'DE');
+      _daaSummaryFuture = backend.getStudentAttendanceSummary(subject: 'DAA');
+      _recentUpdatesFuture = backend.getRecentUpdates();
+      _activeSessionFuture = backend.getLatestActiveSession();
     });
   }
 
@@ -1615,23 +1640,26 @@ class _DashboardScreenState extends State<DashboardScreen> {
     });
   }
 
-  Future<void> _refreshSummary() async {
+  Future<void> _refreshData() async {
     if (widget.role == UserRole.teacher) {
       _loadTeacherSessions();
       await _teacherSessionsFuture;
     } else {
-      if (_selectedSubject != null) {
-        _loadAttendanceSummary(subject: _selectedSubject);
-        await _attendanceSummaryFuture;
-      }
+      _loadAllStudentData();
+      await Future.wait([
+        _sdttSummaryFuture!,
+        _deSummaryFuture!,
+        _daaSummaryFuture!,
+        _recentUpdatesFuture!,
+        _activeSessionFuture!,
+      ]);
     }
   }
 
-  void _onViewAttendance(String subject) {
+  void _onSubjectTapped(String subject) {
     setState(() {
       _selectedSubject = subject;
     });
-    _loadAttendanceSummary(subject: subject);
   }
 
   @override
@@ -1680,9 +1708,7 @@ class _DashboardScreenState extends State<DashboardScreen> {
           );
           if (mounted) {
             if (widget.role == UserRole.student) {
-              if (_selectedSubject != null) {
-                _loadAttendanceSummary(subject: _selectedSubject);
-              }
+              _loadAllStudentData();
             } else {
               _loadTeacherSessions();
             }
@@ -1692,199 +1718,695 @@ class _DashboardScreenState extends State<DashboardScreen> {
       ),
       body: AppBackground(
         child: SafeArea(
-          child: Padding(
-            padding: const EdgeInsets.all(AppSpacing.large),
-            child: Column(
-              children: [
-                const SizedBox(height: 18),
-                FutureBuilder<String>(
-                  future: widget.role == UserRole.student
-                      ? getStudentDisplayName()
-                      : Future.value('Teacher'),
-                  builder: (context, snapshot) {
-                    final displayName = snapshot.data ?? widget.role.label;
-                    return SizedBox(
-                      width: double.infinity,
-                      child: Text(
-                        'Hello, $displayName!',
-                        textAlign: TextAlign.center,
-                        style: const TextStyle(
-                          color: white,
-                          fontSize: 28,
-                          fontWeight: FontWeight.bold,
+          child: RefreshIndicator(
+            onRefresh: _refreshData,
+            color: brandOrange,
+            backgroundColor: Colors.white,
+            child: SingleChildScrollView(
+              physics: const AlwaysScrollableScrollPhysics(),
+              padding: const EdgeInsets.symmetric(horizontal: AppSpacing.large, vertical: 16),
+              child: Column(
+                children: [
+                  // 2. Student greeting section
+                  FutureBuilder<String>(
+                    future: widget.role == UserRole.student
+                        ? getStudentDisplayName()
+                        : Future.value('Teacher'),
+                    builder: (context, snapshot) {
+                      final displayName = snapshot.data ?? widget.role.label;
+                      return Padding(
+                        padding: const EdgeInsets.symmetric(vertical: 8.0),
+                        child: Text(
+                          'Hello, $displayName! 👋',
+                          textAlign: TextAlign.center,
+                          style: const TextStyle(
+                            color: white,
+                            fontSize: 30,
+                            fontWeight: FontWeight.bold,
+                          ),
                         ),
-                      ),
-                    );
-                  },
-                ),
-                const SizedBox(height: 16),
-                Expanded(
-                  child: RefreshIndicator(
-                    onRefresh: _refreshSummary,
-                    color: brandOrange,
-                    backgroundColor: Colors.white,
-                    child: SingleChildScrollView(
-                      physics: const AlwaysScrollableScrollPhysics(),
-                      child: Column(
-                        children: [
-                          if (widget.role == UserRole.teacher &&
-                              _teacherSessionsFuture != null) ...[
-                            _TeacherSessionsOverviewCard(
-                              future: _teacherSessionsFuture!,
-                              onRefresh: _loadTeacherSessions,
-                            ),
-                            const SizedBox(height: 80),
-                          ],
-                          if (widget.role == UserRole.student) ...[
-                            _TodaysClassesSection(
-                              onViewAttendance: _onViewAttendance,
-                            ),
-                            if (_selectedSubject != null && _attendanceSummaryFuture != null) ...[
-                              const SizedBox(height: 24),
-                              FutureBuilder<StudentAttendanceSummary>(
-                                key: ValueKey(_selectedSubject),
-                                future: _attendanceSummaryFuture,
-                                builder: (context, snapshot) {
-                                  if (snapshot.connectionState ==
-                                      ConnectionState.waiting) {
-                                    return Container(
-                                      width: double.infinity,
-                                      constraints:
-                                          const BoxConstraints(maxWidth: 440),
-                                      margin: const EdgeInsets.symmetric(
-                                        horizontal: 4,
-                                        vertical: 12,
-                                      ),
-                                      padding: const EdgeInsets.all(36),
-                                      decoration: BoxDecoration(
-                                        color: Colors.white,
-                                        borderRadius:
-                                            BorderRadius.circular(28),
-                                        boxShadow: const [
-                                          BoxShadow(
-                                            color: Color(0x18102040),
-                                            blurRadius: 24,
-                                            offset: Offset(0, 10),
-                                          ),
-                                        ],
-                                      ),
-                                      child: const Column(
-                                        mainAxisSize: MainAxisSize.min,
-                                        children: [
-                                          CircularProgressIndicator(
-                                            color: brandOrange,
-                                          ),
-                                          SizedBox(height: 18),
-                                          Text(
-                                            'Loading your attendance summary...',
-                                            style: TextStyle(
-                                              fontSize: 14,
-                                              color: mutedInk,
-                                              fontWeight: FontWeight.w500,
-                                            ),
-                                          ),
-                                        ],
-                                      ),
-                                    );
-                                  }
-
-                                  if (snapshot.hasError) {
-                                    return Container(
-                                      width: double.infinity,
-                                      constraints:
-                                          const BoxConstraints(maxWidth: 440),
-                                      margin: const EdgeInsets.symmetric(
-                                        horizontal: 4,
-                                        vertical: 12,
-                                      ),
-                                      padding: const EdgeInsets.all(26),
-                                      decoration: BoxDecoration(
-                                        color: Colors.white,
-                                        borderRadius:
-                                            BorderRadius.circular(28),
-                                        boxShadow: const [
-                                          BoxShadow(
-                                            color: Color(0x18102040),
-                                            blurRadius: 24,
-                                            offset: Offset(0, 10),
-                                          ),
-                                        ],
-                                      ),
-                                      child: Column(
-                                        mainAxisSize: MainAxisSize.min,
-                                        children: [
-                                          const Icon(
-                                            Icons.sync_problem_rounded,
-                                            color: Color(0xFFDC2626),
-                                            size: 42,
-                                          ),
-                                          const SizedBox(height: 12),
-                                          const Text(
-                                            'Could not load attendance summary',
-                                            style: TextStyle(
-                                              fontSize: 16,
-                                              fontWeight: FontWeight.bold,
-                                              color: ink,
-                                            ),
-                                          ),
-                                          const SizedBox(height: 6),
-                                          Text(
-                                            '${snapshot.error}',
-                                            textAlign: TextAlign.center,
-                                            style: const TextStyle(
-                                              fontSize: 13,
-                                              color: mutedInk,
-                                            ),
-                                          ),
-                                          const SizedBox(height: 16),
-                                          ElevatedButton.icon(
-                                            onPressed: () => _loadAttendanceSummary(subject: _selectedSubject),
-                                            icon: const Icon(Icons.refresh),
-                                            label: const Text('RETRY'),
-                                            style: ElevatedButton.styleFrom(
-                                              backgroundColor: brandOrange,
-                                              foregroundColor: white,
-                                            ),
-                                          ),
-                                        ],
-                                      ),
-                                    );
-                                  }
-
-                                  final summary = snapshot.data ??
-                                      StudentAttendanceSummary.empty();
-
-                                  return Column(
-                                    children: [
-                                      Padding(
-                                        padding: const EdgeInsets.symmetric(vertical: 8.0),
-                                        child: Text(
-                                          'Attendance Overview — $_selectedSubject',
-                                          style: const TextStyle(
-                                            color: white,
-                                            fontSize: 20,
-                                            fontWeight: FontWeight.bold,
-                                          ),
-                                        ),
-                                      ),
-                                      AttendanceSummary.fromSummary(summary),
-                                    ],
-                                  );
-                                },
-                              ),
-                            ],
-                            const SizedBox(height: 90),
-                          ],
-                        ],
-                      ),
-                    ),
+                      );
+                    },
                   ),
-                ),
-              ],
+                  
+                  const SizedBox(height: 28),
+
+                  if (isTeacher) ...[
+                     if (_teacherSessionsFuture != null)
+                      _TeacherSessionsOverviewCard(
+                        future: _teacherSessionsFuture!,
+                        onRefresh: _loadTeacherSessions,
+                      ),
+                    const SizedBox(height: 80),
+                  ] else ...[
+                    // 3. Live Attendance Status
+
+                    // 4. Today's Classes
+                    _TodaysClassesHorizontal(
+                      selectedSubject: _selectedSubject,
+                      onSubjectTapped: _onSubjectTapped,
+                    ),
+                    
+                    const SizedBox(height: 24),
+                    
+                    // 5. Subject Attendance
+                    _SubjectAttendanceCard(
+                      sdttFuture: _sdttSummaryFuture,
+                      deFuture: _deSummaryFuture,
+                      daaFuture: _daaSummaryFuture,
+                      selectedSubject: _selectedSubject,
+                    ),
+                    
+                    const SizedBox(height: 24),
+                    
+                    // 6. Recent Updates
+                    _RecentUpdatesCard(future: _recentUpdatesFuture),
+                    
+                    const SizedBox(height: 100),
+                  ],
+                ],
+              ),
             ),
           ),
         ),
       ),
+    );
+  }
+}
+
+class _LiveAttendanceStatusCard extends StatelessWidget {
+  const _LiveAttendanceStatusCard({
+    required this.bleState,
+    required this.activeSessionFuture,
+  });
+
+  final BluetoothAdapterState bleState;
+  final Future<ActiveAttendanceSession?>? activeSessionFuture;
+
+  @override
+  Widget build(BuildContext context) {
+    final bool isBleOn = bleState == BluetoothAdapterState.on;
+    
+    return Container(
+      width: double.infinity,
+      constraints: const BoxConstraints(maxWidth: 440),
+      padding: const EdgeInsets.all(22),
+      decoration: BoxDecoration(
+        color: Colors.white,
+        borderRadius: BorderRadius.circular(28),
+        boxShadow: const [
+          BoxShadow(
+            color: Color(0x18102040),
+            blurRadius: 24,
+            offset: Offset(0, 10),
+          ),
+        ],
+      ),
+      child: FutureBuilder<ActiveAttendanceSession?>(
+        future: activeSessionFuture,
+        builder: (context, snapshot) {
+          final activeSession = snapshot.data;
+          final bool isSessionActive = activeSession != null;
+          
+          return Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              const Row(
+                children: [
+                  Icon(Icons.sensors, color: deepNavy, size: 24),
+                  SizedBox(width: 12),
+                  Text(
+                    'Live Attendance Status',
+                    style: TextStyle(
+                      fontSize: 19,
+                      fontWeight: FontWeight.bold,
+                      color: ink,
+                    ),
+                  ),
+                ],
+              ),
+              const SizedBox(height: 20),
+              _StatusRow(
+                label: 'Bluetooth',
+                value: isBleOn ? 'Connected' : 'Disconnected',
+                valueColor: isBleOn ? const Color(0xFF16A34A) : const Color(0xFFDC2626),
+              ),
+              const SizedBox(height: 12),
+              _StatusRow(
+                label: 'Active Session',
+                value: isSessionActive ? activeSession.title : 'No Active Session',
+                valueColor: isSessionActive ? brandOrange : mutedInk,
+              ),
+              const SizedBox(height: 12),
+              _StatusRow(
+                label: 'Verification',
+                value: isSessionActive ? 'Ready to Scan' : 'Waiting for session...',
+                valueColor: isSessionActive ? brandBlue : mutedInk,
+              ),
+              const SizedBox(height: 24),
+              SizedBox(
+                width: double.infinity,
+                child: ElevatedButton.icon(
+                  onPressed: isSessionActive && isBleOn
+                      ? () => Navigator.push(
+                            context,
+                            MaterialPageRoute(builder: (_) => const StudentBleScreen()),
+                          )
+                      : null,
+                  icon: const Icon(Icons.qr_code_scanner),
+                  label: const Text('SCAN QR CODE'),
+                  style: ElevatedButton.styleFrom(
+                    backgroundColor: brandOrange,
+                    foregroundColor: white,
+                    disabledBackgroundColor: const Color(0xFFE2E8F0),
+                    disabledForegroundColor: const Color(0xFF94A3B8),
+                    padding: const EdgeInsets.symmetric(vertical: 16),
+                  ),
+                ),
+              ),
+            ],
+          );
+        },
+      ),
+    );
+  }
+}
+
+class _StatusRow extends StatelessWidget {
+  const _StatusRow({
+    required this.label,
+    required this.value,
+    required this.valueColor,
+  });
+
+  final String label;
+  final String value;
+  final Color valueColor;
+
+  @override
+  Widget build(BuildContext context) {
+    return Row(
+      mainAxisAlignment: MainAxisAlignment.spaceBetween,
+      children: [
+        Text(
+          label,
+          style: const TextStyle(
+            color: ink,
+            fontSize: 15,
+            fontWeight: FontWeight.w600,
+          ),
+        ),
+        Text(
+          value,
+          style: TextStyle(
+            color: valueColor,
+            fontSize: 15,
+            fontWeight: FontWeight.bold,
+          ),
+        ),
+      ],
+    );
+  }
+}
+
+class _TodaysClassesHorizontal extends StatelessWidget {
+  const _TodaysClassesHorizontal({
+    required this.selectedSubject,
+    required this.onSubjectTapped,
+  });
+
+  final String? selectedSubject;
+  final Function(String) onSubjectTapped;
+
+  @override
+  Widget build(BuildContext context) {
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        const Padding(
+          padding: EdgeInsets.only(left: 4, bottom: 16),
+          child: Row(
+            children: [
+              Icon(Icons.calendar_today, color: brandOrange, size: 18),
+              SizedBox(width: 10),
+              Text(
+                "Today's Classes",
+                style: TextStyle(
+                  color: white,
+                  fontSize: 20,
+                  fontWeight: FontWeight.bold,
+                ),
+              ),
+            ],
+          ),
+        ),
+        SingleChildScrollView(
+          scrollDirection: Axis.horizontal,
+          physics: const BouncingScrollPhysics(),
+          child: Row(
+            children: [
+              _SubjectCard(
+                name: 'SDTT',
+                icon: Icons.code_rounded,
+                isSelected: selectedSubject == 'SDTT',
+                onTap: () => onSubjectTapped('SDTT'),
+              ),
+              const SizedBox(width: 16),
+              _SubjectCard(
+                name: 'DE',
+                icon: Icons.memory_rounded,
+                isSelected: selectedSubject == 'DE',
+                onTap: () => onSubjectTapped('DE'),
+              ),
+              const SizedBox(width: 16),
+              _SubjectCard(
+                name: 'DAA',
+                icon: Icons.account_tree_rounded,
+                isSelected: selectedSubject == 'DAA',
+                onTap: () => onSubjectTapped('DAA'),
+              ),
+            ],
+          ),
+        ),
+      ],
+    );
+  }
+}
+
+class _SubjectCard extends StatelessWidget {
+  const _SubjectCard({
+    required this.name,
+    required this.icon,
+    required this.isSelected,
+    required this.onTap,
+  });
+
+  final String name;
+  final IconData icon;
+  final bool isSelected;
+  final VoidCallback onTap;
+
+  @override
+  Widget build(BuildContext context) {
+    return GestureDetector(
+      onTap: onTap,
+      child: AnimatedContainer(
+        duration: const Duration(milliseconds: 250),
+        curve: Curves.easeInOut,
+        width: 120,
+        height: 120,
+        decoration: BoxDecoration(
+          color: isSelected ? brandOrange : Colors.white,
+          borderRadius: BorderRadius.circular(28),
+          boxShadow: [
+            BoxShadow(
+              color: isSelected 
+                  ? brandOrange.withValues(alpha: 0.4) 
+                  : const Color(0x18000000),
+              blurRadius: 16,
+              offset: const Offset(0, 8),
+            ),
+          ],
+          border: Border.all(
+            color: isSelected ? Colors.transparent : const Color(0xFFE2E8F0),
+            width: 1.5,
+          ),
+        ),
+        child: Column(
+          mainAxisAlignment: MainAxisAlignment.center,
+          children: [
+            Icon(
+              icon,
+              size: 36,
+              color: isSelected ? Colors.white : deepNavy,
+            ),
+            const SizedBox(height: 12),
+            Text(
+              name,
+              style: TextStyle(
+                color: isSelected ? Colors.white : ink,
+                fontWeight: FontWeight.bold,
+                fontSize: 17,
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+}
+
+class _SubjectAttendanceCard extends StatelessWidget {
+  const _SubjectAttendanceCard({
+    required this.sdttFuture,
+    required this.deFuture,
+    required this.daaFuture,
+    required this.selectedSubject,
+  });
+
+  final Future<StudentAttendanceSummary>? sdttFuture;
+  final Future<StudentAttendanceSummary>? deFuture;
+  final Future<StudentAttendanceSummary>? daaFuture;
+  final String? selectedSubject;
+
+  @override
+  Widget build(BuildContext context) {
+    return Container(
+      width: double.infinity,
+      constraints: const BoxConstraints(maxWidth: 440),
+      padding: const EdgeInsets.all(22),
+      decoration: BoxDecoration(
+        color: Colors.white,
+        borderRadius: BorderRadius.circular(28),
+        boxShadow: const [
+          BoxShadow(
+            color: Color(0x18102040),
+            blurRadius: 24,
+            offset: Offset(0, 10),
+          ),
+        ],
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          const Row(
+            children: [
+              Icon(Icons.bar_chart_rounded, color: deepNavy, size: 24),
+              SizedBox(width: 12),
+              Text(
+                'Subject Attendance',
+                style: TextStyle(
+                  fontSize: 19,
+                  fontWeight: FontWeight.bold,
+                  color: ink,
+                ),
+              ),
+            ],
+          ),
+          const SizedBox(height: 24),
+          _SubjectProgressRow(
+            subject: 'SDTT',
+            future: sdttFuture,
+            isSelected: selectedSubject == 'SDTT',
+          ),
+          const SizedBox(height: 20),
+          _SubjectProgressRow(
+            subject: 'DE',
+            future: deFuture,
+            isSelected: selectedSubject == 'DE',
+          ),
+          const SizedBox(height: 20),
+          _SubjectProgressRow(
+            subject: 'DAA',
+            future: daaFuture,
+            isSelected: selectedSubject == 'DAA',
+          ),
+          const SizedBox(height: 28),
+          SizedBox(
+            width: double.infinity,
+            child: OutlinedButton(
+              onPressed: () {
+                // Future implementation: Detailed stats page
+              },
+              style: OutlinedButton.styleFrom(
+                side: const BorderSide(color: deepNavy, width: 1.5),
+                shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(16)),
+              ),
+              child: const Text(
+                'VIEW DETAILS',
+                style: TextStyle(fontWeight: FontWeight.bold, letterSpacing: 0.5),
+              ),
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+class _SubjectProgressRow extends StatelessWidget {
+  const _SubjectProgressRow({
+    required this.subject,
+    required this.future,
+    required this.isSelected,
+  });
+
+  final String subject;
+  final Future<StudentAttendanceSummary>? future;
+  final bool isSelected;
+
+  @override
+  Widget build(BuildContext context) {
+    return FutureBuilder<StudentAttendanceSummary>(
+      future: future,
+      builder: (context, snapshot) {
+        final double percentage = snapshot.data?.percentage ?? 0.0;
+        final bool isLow = percentage < 75 && snapshot.hasData;
+
+        return AnimatedContainer(
+          duration: const Duration(milliseconds: 300),
+          padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 12),
+          decoration: BoxDecoration(
+            color: isSelected ? const Color(0xFFF8FAFC) : Colors.transparent,
+            borderRadius: BorderRadius.circular(20),
+            border: Border.all(
+              color: isSelected ? const Color(0xFFE2E8F0) : Colors.transparent,
+              width: 1,
+            ),
+          ),
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Row(
+                mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                children: [
+                  Text(
+                    subject,
+                    style: TextStyle(
+                      color: ink,
+                      fontWeight: isSelected ? FontWeight.bold : FontWeight.w600,
+                      fontSize: 16,
+                    ),
+                  ),
+                  Text(
+                    snapshot.connectionState == ConnectionState.waiting
+                        ? '...'
+                        : '${percentage.toStringAsFixed(0)}%',
+                    style: TextStyle(
+                      color: isLow ? const Color(0xFFDC2626) : ink,
+                      fontWeight: FontWeight.bold,
+                      fontSize: 16,
+                    ),
+                  ),
+                ],
+              ),
+              const SizedBox(height: 10),
+              Stack(
+                children: [
+                  Container(
+                    height: 10,
+                    width: double.infinity,
+                    decoration: BoxDecoration(
+                      color: const Color(0xFFF1F5F9),
+                      borderRadius: BorderRadius.circular(5),
+                    ),
+                  ),
+                  LayoutBuilder(
+                    builder: (context, constraints) {
+                      return AnimatedContainer(
+                        duration: const Duration(milliseconds: 800),
+                        height: 10,
+                        width: constraints.maxWidth * (percentage / 100),
+                        decoration: BoxDecoration(
+                          gradient: LinearGradient(
+                            colors: isLow 
+                              ? [const Color(0xFFF87171), const Color(0xFFDC2626)]
+                              : [brandBlue.withValues(alpha: 0.8), brandBlue],
+                          ),
+                          borderRadius: BorderRadius.circular(5),
+                          boxShadow: [
+                            if (!isLow && percentage > 0)
+                              BoxShadow(
+                                color: brandBlue.withValues(alpha: 0.2),
+                                blurRadius: 4,
+                                offset: const Offset(0, 2),
+                              ),
+                          ],
+                        ),
+                      );
+                    }
+                  ),
+                ],
+              ),
+            ],
+          ),
+        );
+      },
+    );
+  }
+}
+
+class _RecentUpdatesCard extends StatelessWidget {
+  const _RecentUpdatesCard({required this.future});
+
+  final Future<List<Map<String, dynamic>>>? future;
+
+  @override
+  Widget build(BuildContext context) {
+    return Container(
+      width: double.infinity,
+      constraints: const BoxConstraints(maxWidth: 440),
+      padding: const EdgeInsets.all(22),
+      decoration: BoxDecoration(
+        color: Colors.white,
+        borderRadius: BorderRadius.circular(28),
+        boxShadow: const [
+          BoxShadow(
+            color: Color(0x18102040),
+            blurRadius: 24,
+            offset: Offset(0, 10),
+          ),
+        ],
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          const Row(
+            children: [
+              Icon(Icons.notifications_active_rounded, color: deepNavy, size: 24),
+              SizedBox(width: 12),
+              Text(
+                'Recent Updates',
+                style: TextStyle(
+                  fontSize: 19,
+                  fontWeight: FontWeight.bold,
+                  color: ink,
+                ),
+              ),
+            ],
+          ),
+          const SizedBox(height: 20),
+          FutureBuilder<List<Map<String, dynamic>>>(
+            future: future,
+            builder: (context, snapshot) {
+              if (snapshot.connectionState == ConnectionState.waiting) {
+                return const Center(child: Padding(
+                  padding: EdgeInsets.all(20.0),
+                  child: CircularProgressIndicator(strokeWidth: 2),
+                ));
+              }
+              
+              final updates = snapshot.data ?? [];
+              
+              if (updates.isEmpty) {
+                return const Padding(
+                  padding: EdgeInsets.symmetric(vertical: 20.0),
+                  child: Center(
+                    child: Text(
+                      'No recent updates found.',
+                      style: TextStyle(color: mutedInk, fontSize: 14),
+                    ),
+                  ),
+                );
+              }
+
+              return ListView.separated(
+                shrinkWrap: true,
+                physics: const NeverScrollableScrollPhysics(),
+                itemCount: updates.length,
+                separatorBuilder: (_, __) => const Divider(height: 32, color: Color(0xFFF1F5F9)),
+                itemBuilder: (context, index) {
+                  final update = updates[index];
+                  final session = update['attendance_sessions'] as Map<String, dynamic>?;
+                  final subjectName = session?['title']?.toString() ?? 'Session';
+                  final markedAt = DateTime.tryParse(update['marked_at']?.toString() ?? '') ?? DateTime.now();
+                  final status = update['status']?.toString().toUpperCase() ?? 'PRESENT';
+                  
+                  return _UpdateItem(
+                    icon: status == 'PRESENT' ? Icons.check_circle_rounded : Icons.info_rounded,
+                    iconColor: status == 'PRESENT' ? const Color(0xFF16A34A) : brandBlue,
+                    title: 'Attendance $status',
+                    subtitle: 'Recorded for $subjectName',
+                    time: _formatTimeAgo(markedAt),
+                  );
+                },
+              );
+            },
+          ),
+        ],
+      ),
+    );
+  }
+
+  String _formatTimeAgo(DateTime dateTime) {
+    final diff = DateTime.now().difference(dateTime);
+    if (diff.inMinutes < 60) return '${diff.inMinutes}m ago';
+    if (diff.inHours < 24) return '${diff.inHours}h ago';
+    return '${diff.inDays}d ago';
+  }
+}
+
+class _UpdateItem extends StatelessWidget {
+  const _UpdateItem({
+    required this.icon,
+    required this.iconColor,
+    required this.title,
+    required this.subtitle,
+    required this.time,
+  });
+
+  final IconData icon;
+  final Color iconColor;
+  final String title;
+  final String subtitle;
+  final String time;
+
+  @override
+  Widget build(BuildContext context) {
+    return Row(
+      children: [
+        Container(
+          padding: const EdgeInsets.all(12),
+          decoration: BoxDecoration(
+            color: iconColor.withValues(alpha: 0.1),
+            shape: BoxShape.circle,
+          ),
+          child: Icon(icon, color: iconColor, size: 22),
+        ),
+        const SizedBox(width: 16),
+        Expanded(
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Text(
+                title,
+                style: const TextStyle(
+                  color: ink,
+                  fontWeight: FontWeight.bold,
+                  fontSize: 15,
+                ),
+              ),
+              const SizedBox(height: 3),
+              Text(
+                subtitle,
+                style: const TextStyle(
+                  color: mutedInk,
+                  fontSize: 13,
+                  fontWeight: FontWeight.w500,
+                ),
+              ),
+            ],
+          ),
+        ),
+        Text(
+          time,
+          style: const TextStyle(
+            color: mutedInk,
+            fontSize: 12,
+            fontWeight: FontWeight.w600,
+          ),
+        ),
+      ],
     );
   }
 }
@@ -2172,152 +2694,6 @@ class _TeacherSessionCard extends StatelessWidget {
             const Icon(
               Icons.chevron_right,
               color: Color(0xFF94A3B8),
-            ),
-          ],
-        ),
-      ),
-    );
-  }
-}
-
-class _TodaysClassesSection extends StatelessWidget {
-  final Function(String) onViewAttendance;
-
-  const _TodaysClassesSection({required this.onViewAttendance});
-
-  @override
-  Widget build(BuildContext context) {
-    return Container(
-      width: double.infinity,
-      constraints: const BoxConstraints(maxWidth: 440),
-      child: Column(
-        crossAxisAlignment: CrossAxisAlignment.start,
-        children: [
-          const Padding(
-            padding: EdgeInsets.symmetric(horizontal: 6, vertical: 4),
-            child: Row(
-              children: [
-                Icon(
-                  Icons.calendar_today_rounded,
-                  size: 18,
-                  color: brandOrange,
-                ),
-                SizedBox(width: 8),
-                Text(
-                  "Today's Classes",
-                  style: TextStyle(
-                    color: white,
-                    fontSize: 20,
-                    fontWeight: FontWeight.bold,
-                  ),
-                ),
-              ],
-            ),
-          ),
-          const SizedBox(height: 12),
-          _SubjectClassCard(
-            subjectName: 'SDTT',
-            icon: Icons.book_rounded,
-            iconColor: Colors.blue.shade700,
-            iconBgColor: const Color(0xFFEFF6FF),
-            onViewAttendance: () => onViewAttendance('SDTT'),
-          ),
-          const SizedBox(height: 10),
-          _SubjectClassCard(
-            subjectName: 'DE',
-            icon: Icons.book_rounded,
-            iconColor: Colors.green.shade700,
-            iconBgColor: const Color(0xFFF0FDF4),
-            onViewAttendance: () => onViewAttendance('DE'),
-          ),
-          const SizedBox(height: 10),
-          _SubjectClassCard(
-            subjectName: 'DAA',
-            icon: Icons.book_rounded,
-            iconColor: Colors.orange.shade700,
-            iconBgColor: const Color(0xFFFFF7ED),
-            onViewAttendance: () => onViewAttendance('DAA'),
-          ),
-        ],
-      ),
-    );
-  }
-}
-
-class _SubjectClassCard extends StatelessWidget {
-  const _SubjectClassCard({
-    required this.subjectName,
-    required this.icon,
-    required this.iconColor,
-    required this.iconBgColor,
-    required this.onViewAttendance,
-  });
-
-  final String subjectName;
-  final IconData icon;
-  final Color iconColor;
-  final Color iconBgColor;
-  final VoidCallback onViewAttendance;
-
-  @override
-  Widget build(BuildContext context) {
-    return Container(
-      width: double.infinity,
-      constraints: const BoxConstraints(maxWidth: 440),
-      margin: const EdgeInsets.symmetric(horizontal: 4),
-      decoration: BoxDecoration(
-        color: Colors.white,
-        borderRadius: BorderRadius.circular(20),
-        boxShadow: const [
-          BoxShadow(
-            color: Color(0x18102040),
-            blurRadius: 18,
-            offset: Offset(0, 6),
-          ),
-        ],
-      ),
-      child: Padding(
-        padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
-        child: Row(
-          children: [
-            Container(
-              width: 44,
-              height: 44,
-              decoration: BoxDecoration(
-                color: iconBgColor,
-                borderRadius: BorderRadius.circular(12),
-              ),
-              child: Icon(icon, color: iconColor, size: 24),
-            ),
-            const SizedBox(width: 14),
-            Expanded(
-              child: Text(
-                subjectName,
-                style: const TextStyle(
-                  color: ink,
-                  fontSize: 17,
-                  fontWeight: FontWeight.bold,
-                  letterSpacing: 0.5,
-                ),
-              ),
-            ),
-            ElevatedButton(
-              onPressed: onViewAttendance,
-              style: ElevatedButton.styleFrom(
-                backgroundColor: deepNavy,
-                foregroundColor: white,
-                elevation: 0,
-                padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
-                minimumSize: Size.zero,
-                tapTargetSize: MaterialTapTargetSize.shrinkWrap,
-                shape: RoundedRectangleBorder(
-                  borderRadius: BorderRadius.circular(12),
-                ),
-              ),
-              child: const Text(
-                'View Attendance',
-                style: TextStyle(fontSize: 12, fontWeight: FontWeight.bold),
-              ),
             ),
           ],
         ),

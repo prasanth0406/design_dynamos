@@ -595,6 +595,45 @@ class AttendanceBackend {
     }
   }
 
+  Future<List<Map<String, dynamic>>> getRecentUpdates() async {
+    final uid = _client.auth.currentUser?.id;
+    if (uid == null) return [];
+
+    try {
+      final response = await _client
+          .from('attendance_records')
+          .select('marked_at, status, attendance_sessions(title)')
+          .eq('student_id', uid)
+          .order('marked_at', ascending: false)
+          .limit(5);
+
+      return List<Map<String, dynamic>>.from(response as List);
+    } catch (e) {
+      debugPrint('Error loading recent updates: $e');
+      return [];
+    }
+  }
+
+  Future<ActiveAttendanceSession?> getLatestActiveSession() async {
+    try {
+      final now = DateTime.now().toIso8601String();
+      final response = await _client
+          .from('attendance_sessions')
+          .select('id, session_code, title, ends_at')
+          .eq('is_active', true)
+          .gt('ends_at', now)
+          .order('starts_at', ascending: false)
+          .limit(1)
+          .maybeSingle();
+
+      if (response == null) return null;
+      return ActiveAttendanceSession.fromJson(response);
+    } catch (e) {
+      debugPrint('Error fetching latest active session: $e');
+      return null;
+    }
+  }
+
   // --------------------------------------------------------------------------
   // Teacher Session Roster & Manual Attendance Management
   // --------------------------------------------------------------------------
