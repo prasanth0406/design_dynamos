@@ -1554,12 +1554,14 @@ class _DashboardScreenState extends State<DashboardScreen> {
   Future<StudentAttendanceSummary>? _attendanceSummaryFuture;
   Future<List<TeacherSession>>? _teacherSessionsFuture;
   RealtimeChannel? _studentAttendanceChannel;
+  String? _selectedSubject;
 
   @override
   void initState() {
     super.initState();
     if (widget.role == UserRole.student) {
-      _loadAttendanceSummary();
+      // Initially, we don't load summary until a subject is selected
+      // Or we can load overall summary. The request says "subject-specific Attendance Overview card that appears... when a student clicks"
       _setupRealtimeSubscription();
     } else {
       _loadTeacherSessions();
@@ -1591,18 +1593,18 @@ class _DashboardScreenState extends State<DashboardScreen> {
           value: uid,
         ),
         callback: (_) {
-          if (mounted) {
-            _loadAttendanceSummary();
+          if (mounted && _selectedSubject != null) {
+            _loadAttendanceSummary(subject: _selectedSubject);
           }
         },
       )
       ..subscribe();
   }
 
-  void _loadAttendanceSummary() {
+  void _loadAttendanceSummary({String? subject}) {
     final backend = AttendanceBackend(Supabase.instance.client);
     setState(() {
-      _attendanceSummaryFuture = backend.getStudentAttendanceSummary();
+      _attendanceSummaryFuture = backend.getStudentAttendanceSummary(subject: subject);
     });
   }
 
@@ -1618,9 +1620,18 @@ class _DashboardScreenState extends State<DashboardScreen> {
       _loadTeacherSessions();
       await _teacherSessionsFuture;
     } else {
-      _loadAttendanceSummary();
-      await _attendanceSummaryFuture;
+      if (_selectedSubject != null) {
+        _loadAttendanceSummary(subject: _selectedSubject);
+        await _attendanceSummaryFuture;
+      }
     }
+  }
+
+  void _onViewAttendance(String subject) {
+    setState(() {
+      _selectedSubject = subject;
+    });
+    _loadAttendanceSummary(subject: subject);
   }
 
   @override
@@ -1669,7 +1680,9 @@ class _DashboardScreenState extends State<DashboardScreen> {
           );
           if (mounted) {
             if (widget.role == UserRole.student) {
-              _loadAttendanceSummary();
+              if (_selectedSubject != null) {
+                _loadAttendanceSummary(subject: _selectedSubject);
+              }
             } else {
               _loadTeacherSessions();
             }
@@ -1722,124 +1735,145 @@ class _DashboardScreenState extends State<DashboardScreen> {
                             ),
                             const SizedBox(height: 80),
                           ],
-                          if (widget.role == UserRole.student &&
-                              _attendanceSummaryFuture != null) ...[
-                            FutureBuilder<StudentAttendanceSummary>(
-                              future: _attendanceSummaryFuture,
-                              builder: (context, snapshot) {
-                                if (snapshot.connectionState ==
-                                    ConnectionState.waiting) {
-                                  return Container(
-                                    width: double.infinity,
-                                    constraints:
-                                        const BoxConstraints(maxWidth: 440),
-                                    margin: const EdgeInsets.symmetric(
-                                      horizontal: 4,
-                                      vertical: 12,
-                                    ),
-                                    padding: const EdgeInsets.all(36),
-                                    decoration: BoxDecoration(
-                                      color: Colors.white,
-                                      borderRadius:
-                                          BorderRadius.circular(28),
-                                      boxShadow: const [
-                                        BoxShadow(
-                                          color: Color(0x18102040),
-                                          blurRadius: 24,
-                                          offset: Offset(0, 10),
-                                        ),
-                                      ],
-                                    ),
-                                    child: const Column(
-                                      mainAxisSize: MainAxisSize.min,
-                                      children: [
-                                        CircularProgressIndicator(
-                                          color: brandOrange,
-                                        ),
-                                        SizedBox(height: 18),
-                                        Text(
-                                          'Loading your attendance summary...',
-                                          style: TextStyle(
-                                            fontSize: 14,
-                                            color: mutedInk,
-                                            fontWeight: FontWeight.w500,
-                                          ),
-                                        ),
-                                      ],
-                                    ),
-                                  );
-                                }
-
-                                if (snapshot.hasError) {
-                                  return Container(
-                                    width: double.infinity,
-                                    constraints:
-                                        const BoxConstraints(maxWidth: 440),
-                                    margin: const EdgeInsets.symmetric(
-                                      horizontal: 4,
-                                      vertical: 12,
-                                    ),
-                                    padding: const EdgeInsets.all(26),
-                                    decoration: BoxDecoration(
-                                      color: Colors.white,
-                                      borderRadius:
-                                          BorderRadius.circular(28),
-                                      boxShadow: const [
-                                        BoxShadow(
-                                          color: Color(0x18102040),
-                                          blurRadius: 24,
-                                          offset: Offset(0, 10),
-                                        ),
-                                      ],
-                                    ),
-                                    child: Column(
-                                      mainAxisSize: MainAxisSize.min,
-                                      children: [
-                                        const Icon(
-                                          Icons.sync_problem_rounded,
-                                          color: Color(0xFFDC2626),
-                                          size: 42,
-                                        ),
-                                        const SizedBox(height: 12),
-                                        const Text(
-                                          'Could not load attendance summary',
-                                          style: TextStyle(
-                                            fontSize: 16,
-                                            fontWeight: FontWeight.bold,
-                                            color: ink,
-                                          ),
-                                        ),
-                                        const SizedBox(height: 6),
-                                        Text(
-                                          '${snapshot.error}',
-                                          textAlign: TextAlign.center,
-                                          style: const TextStyle(
-                                            fontSize: 13,
-                                            color: mutedInk,
-                                          ),
-                                        ),
-                                        const SizedBox(height: 16),
-                                        ElevatedButton.icon(
-                                          onPressed: _loadAttendanceSummary,
-                                          icon: const Icon(Icons.refresh),
-                                          label: const Text('RETRY'),
-                                          style: ElevatedButton.styleFrom(
-                                            backgroundColor: brandOrange,
-                                            foregroundColor: white,
-                                          ),
-                                        ),
-                                      ],
-                                    ),
-                                  );
-                                }
-
-                                final summary = snapshot.data ??
-                                    StudentAttendanceSummary.empty();
-
-                                return AttendanceSummary.fromSummary(summary);
-                              },
+                          if (widget.role == UserRole.student) ...[
+                            _TodaysClassesSection(
+                              onViewAttendance: _onViewAttendance,
                             ),
-                            const SizedBox(height: 80),
+                            if (_selectedSubject != null && _attendanceSummaryFuture != null) ...[
+                              const SizedBox(height: 24),
+                              FutureBuilder<StudentAttendanceSummary>(
+                                key: ValueKey(_selectedSubject),
+                                future: _attendanceSummaryFuture,
+                                builder: (context, snapshot) {
+                                  if (snapshot.connectionState ==
+                                      ConnectionState.waiting) {
+                                    return Container(
+                                      width: double.infinity,
+                                      constraints:
+                                          const BoxConstraints(maxWidth: 440),
+                                      margin: const EdgeInsets.symmetric(
+                                        horizontal: 4,
+                                        vertical: 12,
+                                      ),
+                                      padding: const EdgeInsets.all(36),
+                                      decoration: BoxDecoration(
+                                        color: Colors.white,
+                                        borderRadius:
+                                            BorderRadius.circular(28),
+                                        boxShadow: const [
+                                          BoxShadow(
+                                            color: Color(0x18102040),
+                                            blurRadius: 24,
+                                            offset: Offset(0, 10),
+                                          ),
+                                        ],
+                                      ),
+                                      child: const Column(
+                                        mainAxisSize: MainAxisSize.min,
+                                        children: [
+                                          CircularProgressIndicator(
+                                            color: brandOrange,
+                                          ),
+                                          SizedBox(height: 18),
+                                          Text(
+                                            'Loading your attendance summary...',
+                                            style: TextStyle(
+                                              fontSize: 14,
+                                              color: mutedInk,
+                                              fontWeight: FontWeight.w500,
+                                            ),
+                                          ),
+                                        ],
+                                      ),
+                                    );
+                                  }
+
+                                  if (snapshot.hasError) {
+                                    return Container(
+                                      width: double.infinity,
+                                      constraints:
+                                          const BoxConstraints(maxWidth: 440),
+                                      margin: const EdgeInsets.symmetric(
+                                        horizontal: 4,
+                                        vertical: 12,
+                                      ),
+                                      padding: const EdgeInsets.all(26),
+                                      decoration: BoxDecoration(
+                                        color: Colors.white,
+                                        borderRadius:
+                                            BorderRadius.circular(28),
+                                        boxShadow: const [
+                                          BoxShadow(
+                                            color: Color(0x18102040),
+                                            blurRadius: 24,
+                                            offset: Offset(0, 10),
+                                          ),
+                                        ],
+                                      ),
+                                      child: Column(
+                                        mainAxisSize: MainAxisSize.min,
+                                        children: [
+                                          const Icon(
+                                            Icons.sync_problem_rounded,
+                                            color: Color(0xFFDC2626),
+                                            size: 42,
+                                          ),
+                                          const SizedBox(height: 12),
+                                          const Text(
+                                            'Could not load attendance summary',
+                                            style: TextStyle(
+                                              fontSize: 16,
+                                              fontWeight: FontWeight.bold,
+                                              color: ink,
+                                            ),
+                                          ),
+                                          const SizedBox(height: 6),
+                                          Text(
+                                            '${snapshot.error}',
+                                            textAlign: TextAlign.center,
+                                            style: const TextStyle(
+                                              fontSize: 13,
+                                              color: mutedInk,
+                                            ),
+                                          ),
+                                          const SizedBox(height: 16),
+                                          ElevatedButton.icon(
+                                            onPressed: () => _loadAttendanceSummary(subject: _selectedSubject),
+                                            icon: const Icon(Icons.refresh),
+                                            label: const Text('RETRY'),
+                                            style: ElevatedButton.styleFrom(
+                                              backgroundColor: brandOrange,
+                                              foregroundColor: white,
+                                            ),
+                                          ),
+                                        ],
+                                      ),
+                                    );
+                                  }
+
+                                  final summary = snapshot.data ??
+                                      StudentAttendanceSummary.empty();
+
+                                  return Column(
+                                    children: [
+                                      Padding(
+                                        padding: const EdgeInsets.symmetric(vertical: 8.0),
+                                        child: Text(
+                                          'Attendance Overview — $_selectedSubject',
+                                          style: const TextStyle(
+                                            color: white,
+                                            fontSize: 20,
+                                            fontWeight: FontWeight.bold,
+                                          ),
+                                        ),
+                                      ),
+                                      AttendanceSummary.fromSummary(summary),
+                                    ],
+                                  );
+                                },
+                              ),
+                            ],
+                            const SizedBox(height: 90),
                           ],
                         ],
                       ),
@@ -2146,4 +2180,227 @@ class _TeacherSessionCard extends StatelessWidget {
   }
 }
 
+class _TodaysClassesSection extends StatelessWidget {
+  final Function(String) onViewAttendance;
 
+  const _TodaysClassesSection({required this.onViewAttendance});
+
+  @override
+  Widget build(BuildContext context) {
+    return Container(
+      width: double.infinity,
+      constraints: const BoxConstraints(maxWidth: 440),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          const Padding(
+            padding: EdgeInsets.symmetric(horizontal: 6, vertical: 4),
+            child: Row(
+              children: [
+                Icon(
+                  Icons.calendar_today_rounded,
+                  size: 18,
+                  color: brandOrange,
+                ),
+                SizedBox(width: 8),
+                Text(
+                  "Today's Classes",
+                  style: TextStyle(
+                    color: white,
+                    fontSize: 20,
+                    fontWeight: FontWeight.bold,
+                  ),
+                ),
+              ],
+            ),
+          ),
+          const SizedBox(height: 12),
+          _SubjectClassCard(
+            subjectName: 'SDTT',
+            icon: Icons.book_rounded,
+            iconColor: Colors.blue.shade700,
+            iconBgColor: const Color(0xFFEFF6FF),
+            onViewAttendance: () => onViewAttendance('SDTT'),
+          ),
+          const SizedBox(height: 10),
+          _SubjectClassCard(
+            subjectName: 'DE',
+            icon: Icons.book_rounded,
+            iconColor: Colors.green.shade700,
+            iconBgColor: const Color(0xFFF0FDF4),
+            onViewAttendance: () => onViewAttendance('DE'),
+          ),
+          const SizedBox(height: 10),
+          _SubjectClassCard(
+            subjectName: 'DAA',
+            icon: Icons.book_rounded,
+            iconColor: Colors.orange.shade700,
+            iconBgColor: const Color(0xFFFFF7ED),
+            onViewAttendance: () => onViewAttendance('DAA'),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+class _SubjectClassCard extends StatelessWidget {
+  const _SubjectClassCard({
+    required this.subjectName,
+    required this.icon,
+    required this.iconColor,
+    required this.iconBgColor,
+    required this.onViewAttendance,
+  });
+
+  final String subjectName;
+  final IconData icon;
+  final Color iconColor;
+  final Color iconBgColor;
+  final VoidCallback onViewAttendance;
+
+  @override
+  Widget build(BuildContext context) {
+    return Container(
+      width: double.infinity,
+      constraints: const BoxConstraints(maxWidth: 440),
+      margin: const EdgeInsets.symmetric(horizontal: 4),
+      decoration: BoxDecoration(
+        color: Colors.white,
+        borderRadius: BorderRadius.circular(20),
+        boxShadow: const [
+          BoxShadow(
+            color: Color(0x18102040),
+            blurRadius: 18,
+            offset: Offset(0, 6),
+          ),
+        ],
+      ),
+      child: Padding(
+        padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
+        child: Row(
+          children: [
+            Container(
+              width: 44,
+              height: 44,
+              decoration: BoxDecoration(
+                color: iconBgColor,
+                borderRadius: BorderRadius.circular(12),
+              ),
+              child: Icon(icon, color: iconColor, size: 24),
+            ),
+            const SizedBox(width: 14),
+            Expanded(
+              child: Text(
+                subjectName,
+                style: const TextStyle(
+                  color: ink,
+                  fontSize: 17,
+                  fontWeight: FontWeight.bold,
+                  letterSpacing: 0.5,
+                ),
+              ),
+            ),
+            ElevatedButton(
+              onPressed: onViewAttendance,
+              style: ElevatedButton.styleFrom(
+                backgroundColor: deepNavy,
+                foregroundColor: white,
+                elevation: 0,
+                padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+                minimumSize: Size.zero,
+                tapTargetSize: MaterialTapTargetSize.shrinkWrap,
+                shape: RoundedRectangleBorder(
+                  borderRadius: BorderRadius.circular(12),
+                ),
+              ),
+              child: const Text(
+                'View Attendance',
+                style: TextStyle(fontSize: 12, fontWeight: FontWeight.bold),
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+}
+
+class ClassDetailsScreen extends StatelessWidget {
+  const ClassDetailsScreen({
+    super.key,
+    required this.subjectName,
+  });
+
+  final String subjectName;
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      appBar: AppBar(
+        title: Text(subjectName),
+        backgroundColor: deepNavy,
+        foregroundColor: white,
+      ),
+      body: AppBackground(
+        child: SafeArea(
+          child: Center(
+            child: SingleChildScrollView(
+              padding: const EdgeInsets.all(AppSpacing.large),
+              child: AppSurfaceCard(
+                child: Column(
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    Container(
+                      width: 64,
+                      height: 64,
+                      decoration: const BoxDecoration(
+                        color: Color(0x22F28A2E),
+                        shape: BoxShape.circle,
+                      ),
+                      child: const Icon(
+                        Icons.school_rounded,
+                        color: brandOrange,
+                        size: 36,
+                      ),
+                    ),
+                    const SizedBox(height: 18),
+                    Text(
+                      subjectName,
+                      textAlign: TextAlign.center,
+                      style: const TextStyle(
+                        color: ink,
+                        fontSize: 26,
+                        fontWeight: FontWeight.bold,
+                      ),
+                    ),
+                    const SizedBox(height: 8),
+                    const Text(
+                      'Class Details',
+                      textAlign: TextAlign.center,
+                      style: TextStyle(
+                        color: mutedInk,
+                        fontSize: 15,
+                        fontWeight: FontWeight.w500,
+                      ),
+                    ),
+                    const SizedBox(height: 18),
+                    const Text(
+                      'Detailed timetable, classroom info, and syllabus for this class will appear here once timetable data is synced.',
+                      textAlign: TextAlign.center,
+                      style: TextStyle(
+                        color: mutedInk,
+                        fontSize: 13,
+                        height: 1.4,
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+}

@@ -536,6 +536,7 @@ class AttendanceBackend {
 
   Future<StudentAttendanceSummary> getStudentAttendanceSummary({
     String? studentId,
+    String? subject,
   }) async {
     final uid = studentId ?? _client.auth.currentUser?.id;
     if (uid == null) {
@@ -544,10 +545,17 @@ class AttendanceBackend {
 
     try {
       // 1. Fetch attendance records for this student with status
-      final recordsResponse = await _client
+      // We join with attendance_sessions to filter by subject title if provided
+      var query = _client
           .from('attendance_records')
-          .select('session_id, status')
+          .select('session_id, status, attendance_sessions!inner(title)')
           .eq('student_id', uid);
+
+      if (subject != null && subject.isNotEmpty) {
+        query = query.ilike('attendance_sessions.title', '%$subject%');
+      }
+
+      final recordsResponse = await query;
 
       int present = 0;
       int absent = 0;
